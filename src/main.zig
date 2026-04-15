@@ -1,8 +1,24 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const latch = @import("latch.zig");
 
 pub fn main() void {
-    run() catch |err| {
+    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+    const backing_allocator, const is_debug = allocator: {
+        break :allocator switch (builtin.mode) {
+            .Debug, .ReleaseSafe => .{ debug_allocator.allocator(), true },
+            .ReleaseFast, .ReleaseSmall => .{ std.heap.smp_allocator, false },
+        };
+    };
+    defer if (is_debug) {
+        _ = debug_allocator.deinit();
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(backing_allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    run(allocator) catch |err| {
         reportError(err) catch |report_err| {
             std.debug.panic("failed to report error: {s}", .{@errorName(report_err)});
         };
@@ -10,11 +26,7 @@ pub fn main() void {
     };
 }
 
-fn run() !void {
-    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = debug_allocator.deinit();
-    const allocator = debug_allocator.allocator();
-
+fn run(allocator: std.mem.Allocator) !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
