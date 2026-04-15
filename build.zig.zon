@@ -1,0 +1,22 @@
+.{
+    .name = .latch,
+    .version = "0.0.0",
+    .fingerprint = 0x473becb5bbc628e5,
+    .dependencies = .{
+        .ziglint = .{
+            .url = "https://github.com/rockorager/ziglint/archive/refs/tags/v0.5.2.tar.gz",
+            .hash = "ziglint-0.5.2-t0bwL2FwBQC5i-ifhKKv2ls5jGXHShJpuNhFVhiU-Tt-",
+        },
+        .uucode = .{
+            .url = "git+https://github.com/jacobsandlund/uucode.git#374ea936b6f1ff9bc0bd9cbce18d6d6e7b20faa2",
+            .hash = "uucode-0.2.0-ZZjBPnmfVADAcIMriJWtbyGUPzGC8vBWb-TC3ZUvXIKX",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "README.md",
+        "examples",
+        "src",
+    },
+}
