@@ -399,6 +399,11 @@ pub fn generateDocumentFromUnifiedDiffWithDiagnostics(
         \\ids stable while moving sections. Refine dependencies only when the
         \\narrative no longer matches the mechanical order.
         \\
+        \\To split one logical patch across multiple diff fences, keep the
+        \\same id on each fence and add part=1, part=2, and so on. Latch
+        \\concatenates those parts before apply; if needed, put depends-on
+        \\only on part=1.
+        \\
         \\If the diff does not provide suitable context, bring in additional
         \\code context with appropriate non-diff code fences.
         \\
