@@ -11,8 +11,9 @@ narrative instead of a raw diff.
 ## Purpose
 
 `latch` turns a diff into a Markdown document with `diff` fences. The generated
-draft is mechanical. Your job is to turn it into a clear code story without
-breaking apply semantics.
+draft is mechanical, but it already includes the patch bodies inline inside
+those `diff` fences. Your job is to turn that draft into a clear code story
+without breaking apply semantics.
 
 ## When To Use It
 
@@ -26,13 +27,16 @@ breaking apply semantics.
 1. Collect the change source.
    Run `latch draft [git-spec]` to generate the draft document. By
    default it writes to stdout.
+   The output already contains the diff content inside `diff` fences, so
+   treat it as an editable first pass, not a blank template.
 2. Save the draft under `.latch/` at the repo root.
    Prefer a path like `.latch/change.latch.md`, then edit that file in
    place.
    Example:
    `mkdir -p .latch && latch draft HEAD~1 > .latch/change.latch.md`
 3. Treat the generated file as scaffolding.
-   It is not the final story.
+   It is not the final story, but it does already contain the concrete
+   patch text that `latch apply` will use.
 4. Rewrite the document into narrative order.
    Start with the clearest explanation of behavior, docs, or externally
    visible effects, then move into internal machinery.
