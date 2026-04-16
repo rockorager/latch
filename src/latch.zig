@@ -438,6 +438,7 @@ pub fn generateDocumentFromUnifiedDiffWithDiagnostics(
             \\
             \\This section was generated from `{s}`.
             \\
+            \\
         ,
             .{ section.path, section.path },
         );
@@ -471,6 +472,7 @@ pub fn generateDocumentFromUnifiedDiffWithDiagnostics(
                 \\### Hunk {d}
                 \\
                 \\This hunk was generated mechanically from `{s}`.
+                \\
                 \\
             ,
                 .{ hunk_index + 1, section.path },
