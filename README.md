@@ -28,6 +28,8 @@ materializes the patch onto a target tree.
 ```
 2 files changed, 12 insertions(+), 1 deletion(-)
 
+## Behavior
+
 `todo list --json` should produce a stable machine-readable format for
 scripts and tooling. The first patch makes that contract explicit.
 
@@ -44,6 +46,8 @@ diff --git a/test/cli_test.zig b/test/cli_test.zig
 +    try expectEqualStrings("[\"buy milk\",\"call mom\"]\\n", output);
 +}
 ```
+
+## Implementation
 
 The implementation then parses the flag and switches the renderer.
 
