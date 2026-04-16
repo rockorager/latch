@@ -181,6 +181,9 @@ pub fn generateDocumentFromUnifiedDiff(allocator: std.mem.Allocator, diff: []con
         \\ids stable while moving sections. Refine dependencies only when the
         \\narrative no longer matches the mechanical order.
         \\
+        \\If the diff does not provide suitable context, bring in additional
+        \\code context with appropriate non-diff code fences.
+        \\
     , .{});
 
     for (sections) |section| {
