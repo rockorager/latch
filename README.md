@@ -17,6 +17,17 @@ materializes the patch onto a target tree.
 ````md
 # Add `--json` output to `todo list`
 
+## Tree
+
+```text
+.
+├── src
+│   └── cli.zig         +6 -1
+└── test
+    └── cli_test.zig    +6 -0
+```
+2 files changed, 12 insertions(+), 1 deletion(-)
+
 `todo list --json` should produce a stable machine-readable format for
 scripts and tooling. The first patch makes that contract explicit.
 
