@@ -18,15 +18,17 @@ pub fn main() void {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
 
-    run(allocator) catch |err| {
-        reportError(err) catch |report_err| {
+    var diagnostics = latch.Diagnostic.init(allocator);
+
+    run(allocator, &diagnostics) catch |err| {
+        reportError(err, &diagnostics) catch |report_err| {
             std.debug.panic("failed to report error: {s}", .{@errorName(report_err)});
         };
         std.process.exit(1);
     };
 }
 
-fn run(allocator: std.mem.Allocator) !void {
+fn run(allocator: std.mem.Allocator, diagnostics: *latch.Diagnostic) !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
@@ -36,11 +38,11 @@ fn run(allocator: std.mem.Allocator) !void {
     }
 
     if (std.mem.eql(u8, args[1], "draft")) {
-        try runDraft(allocator, args[2..]);
+        try runDraft(allocator, args[2..], diagnostics);
         return;
     }
     if (std.mem.eql(u8, args[1], "apply")) {
-        try runApply(allocator, args[2..]);
+        try runApply(allocator, args[2..], diagnostics);
         return;
     }
     if (std.mem.eql(u8, args[1], "-h") or std.mem.eql(u8, args[1], "--help")) {
@@ -52,7 +54,7 @@ fn run(allocator: std.mem.Allocator) !void {
     return error.InvalidCommand;
 }
 
-fn runDraft(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn runDraft(allocator: std.mem.Allocator, args: []const []const u8, diagnostics: *latch.Diagnostic) !void {
     var output_path: ?[]const u8 = null;
     var git_spec: ?[]const u8 = null;
 
@@ -86,12 +88,12 @@ fn runDraft(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     const generated = generated: {
         if (stdin_diff) |diff| {
-            break :generated try latch.generateDocumentFromUnifiedDiff(allocator, diff);
+            break :generated try latch.generateDocumentFromUnifiedDiffWithDiagnostics(allocator, diff, diagnostics);
         }
         if (git_spec) |spec| {
-            break :generated try latch.generateDocumentFromGitSpec(allocator, spec);
+            break :generated try latch.generateDocumentFromGitSpecWithDiagnostics(allocator, spec, diagnostics);
         }
-        break :generated try latch.generateDocumentFromGitDiff(allocator);
+        break :generated try latch.generateDocumentFromGitDiffWithDiagnostics(allocator, diagnostics);
     };
     defer allocator.free(generated);
 
@@ -114,7 +116,7 @@ fn runDraft(allocator: std.mem.Allocator, args: []const []const u8) !void {
     try stdout_writer.interface.flush();
 }
 
-fn runApply(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn runApply(allocator: std.mem.Allocator, args: []const []const u8, diagnostics: *latch.Diagnostic) !void {
     var target_dir: []const u8 = ".";
     var document_path: ?[]const u8 = null;
 
@@ -133,13 +135,13 @@ fn runApply(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     const path = document_path orelse return error.MissingDocumentPath;
 
-    var document = try latch.loadDocumentFromFile(allocator, path);
+    var document = try latch.loadDocumentFromFileWithDiagnostics(allocator, path, diagnostics);
     defer document.deinit();
 
-    const ordered = try document.orderedPatchIndices(allocator);
+    const ordered = try document.orderedPatchIndicesWithDiagnostics(allocator, diagnostics);
     defer allocator.free(ordered);
 
-    try latch.applyPatches(allocator, document.patches, ordered, target_dir);
+    try latch.applyPatchesWithDiagnostics(allocator, document.patches, ordered, target_dir, diagnostics);
 
     var stdout_buffer: [1024]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
@@ -164,9 +166,15 @@ fn printUsage() !void {
     try stderr_writer.interface.flush();
 }
 
-fn reportError(err: anyerror) !void {
+fn reportError(err: anyerror, diagnostics: *const latch.Diagnostic) !void {
     var stderr_buffer: [2048]u8 = undefined;
     var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+
+    if (diagnostics.isSet()) {
+        try writeDiagnostic(&stderr_writer.interface, diagnostics);
+        try stderr_writer.interface.flush();
+        return;
+    }
 
     switch (err) {
         error.InvalidCommand => {
@@ -198,6 +206,122 @@ fn reportError(err: anyerror) !void {
         else => try stderr_writer.interface.print("error: {s}\n", .{@errorName(err)}),
     }
     try stderr_writer.interface.flush();
+}
+
+fn writeDiagnostic(writer: anytype, diagnostics: *const latch.Diagnostic) !void {
+    switch (diagnostics.kind.?) {
+        .no_executable_diffs => try writer.writeAll("error: no executable diff fences found\n"),
+        .no_git_diff => try writer.writeAll("error: no git diff found to generate from\n"),
+        .invalid_diff => try writer.print(
+            "error: invalid unified diff section starting with '{s}'\n",
+            .{diagnostics.detail.?},
+        ),
+        .git_diff_failed => {
+            try writer.writeAll("error: failed to collect git diff\n");
+            if (diagnostics.detail) |detail| {
+                try writer.print("{s}\n", .{detail});
+            }
+        },
+        .duplicate_patch_id => {
+            if (diagnostics.start_line) |start_line| {
+                try writer.print(
+                    "error: duplicate patch id '{s}' at lines {d}-{d}\n",
+                    .{ diagnostics.patch_id.?, start_line, diagnostics.end_line.? },
+                );
+            } else {
+                try writer.print("error: duplicate patch id '{s}'\n", .{diagnostics.patch_id.?});
+            }
+        },
+        .unknown_dependency => try writer.print(
+            "error: patch '{s}' depends on unknown patch '{s}'\n",
+            .{ diagnostics.patch_id.?, diagnostics.related_id.? },
+        ),
+        .self_dependency => try writer.print(
+            "error: patch '{s}' cannot depend on itself\n",
+            .{diagnostics.patch_id.?},
+        ),
+        .dependency_cycle => try writer.print(
+            "error: patch dependency cycle detected among: {s}\n",
+            .{diagnostics.detail.?},
+        ),
+        .unsupported_metadata => {
+            if (diagnostics.metadata_key) |metadata_key| {
+                try writer.print(
+                    "error: unsupported diff metadata key '{s}' at lines {d}-{d}\n",
+                    .{ metadata_key, diagnostics.start_line.?, diagnostics.end_line.? },
+                );
+            } else {
+                try writer.print(
+                    "error: unsupported diff metadata '{s}' at lines {d}-{d}; expected key=value\n",
+                    .{ diagnostics.metadata_value.?, diagnostics.start_line.?, diagnostics.end_line.? },
+                );
+            }
+        },
+        .missing_patch_id => try writer.print(
+            "error: patch at lines {d}-{d} is missing id=...\n",
+            .{ diagnostics.start_line.?, diagnostics.end_line.? },
+        ),
+        .missing_patch_part => {
+            if (diagnostics.part) |part| {
+                try writer.print(
+                    "error: patch '{s}' is missing part={d}\n",
+                    .{ diagnostics.patch_id.?, part },
+                );
+            } else {
+                try writer.print(
+                    "error: patch '{s}' is split across multiple fences but missing " ++
+                        "part=... on at least one fragment\n",
+                    .{diagnostics.patch_id.?},
+                );
+            }
+        },
+        .invalid_patch_part => {
+            if (diagnostics.metadata_value) |value| {
+                try writer.print(
+                    "error: patch part '{s}' at lines {d}-{d} is not a valid integer\n",
+                    .{ value, diagnostics.start_line.?, diagnostics.end_line.? },
+                );
+            } else if (diagnostics.start_line) |start_line| {
+                try writer.print(
+                    "error: patch '{s}' has invalid part={d} at lines {d}-{d}\n",
+                    .{
+                        diagnostics.patch_id orelse "<unknown>",
+                        diagnostics.part.?,
+                        start_line,
+                        diagnostics.end_line.?,
+                    },
+                );
+            } else {
+                try writer.print(
+                    "error: patch '{s}' has invalid part={d}\n",
+                    .{ diagnostics.patch_id orelse "<unknown>", diagnostics.part.? },
+                );
+            }
+        },
+        .duplicate_patch_part => try writer.print(
+            "error: patch '{s}' repeats part={d} at lines {d}-{d}\n",
+            .{ diagnostics.patch_id.?, diagnostics.part.?, diagnostics.start_line.?, diagnostics.end_line.? },
+        ),
+        .part_dependency_must_be_on_first => try writer.print(
+            "error: patch '{s}' part={d} cannot declare depends-on; use part=1\n",
+            .{ diagnostics.patch_id.?, diagnostics.part.? },
+        ),
+        .apply_failed => {
+            try writer.print(
+                "error: apply patch '{s}' failed with exit code {d}\n",
+                .{ diagnostics.patch_id.?, diagnostics.exit_code.? },
+            );
+            if (diagnostics.detail) |detail| {
+                try writer.print("{s}\n", .{detail});
+            }
+        },
+        .apply_terminated => {
+            try writer.print("error: apply patch '{s}' terminated unexpectedly\n", .{diagnostics.patch_id.?});
+            if (diagnostics.detail) |detail| {
+                try writer.print("{s}\n", .{detail});
+            }
+        },
+    }
 }
 
 test {
