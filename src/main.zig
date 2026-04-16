@@ -35,10 +35,6 @@ fn run(allocator: std.mem.Allocator) !void {
         return;
     }
 
-    if (std.mem.eql(u8, args[1], "plan")) {
-        try runPlan(allocator, args[2..]);
-        return;
-    }
     if (std.mem.eql(u8, args[1], "generate")) {
         try runGenerate(allocator, args[2..]);
         return;
@@ -54,40 +50,6 @@ fn run(allocator: std.mem.Allocator) !void {
 
     try printUsage();
     return error.InvalidCommand;
-}
-
-fn runPlan(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    if (args.len != 1) return error.MissingDocumentPath;
-
-    var document = try latch.loadDocumentFromFile(allocator, args[0]);
-    defer document.deinit();
-
-    const ordered = try document.orderedPatchIndices(allocator);
-    defer allocator.free(ordered);
-
-    var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-    try stdout_writer.interface.print("document: {s}\n", .{args[0]});
-    try stdout_writer.interface.print("patches: {d}\n", .{document.patches.len});
-    try stdout_writer.interface.writeAll("apply order:\n");
-    for (ordered, 0..) |patch_index, order_index| {
-        const patch = document.patches[patch_index];
-        if (patch.depends_on.len == 0) {
-            try stdout_writer.interface.print(
-                "  {d}. {s} (depends-on: -, lines: {d}-{d})\n",
-                .{ order_index + 1, patch.id, patch.start_line, patch.end_line },
-            );
-            continue;
-        }
-
-        const deps = try std.mem.join(allocator, ",", patch.depends_on);
-        defer allocator.free(deps);
-        try stdout_writer.interface.print(
-            "  {d}. {s} (depends-on: {s}, lines: {d}-{d})\n",
-            .{ order_index + 1, patch.id, deps, patch.start_line, patch.end_line },
-        );
-    }
-    try stdout_writer.interface.flush();
 }
 
 fn runGenerate(allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -146,7 +108,6 @@ fn printUsage() !void {
     var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
     try stderr_writer.interface.writeAll("latch: literate patch proof of concept\n\n");
     try stderr_writer.interface.writeAll("usage:\n");
-    try stderr_writer.interface.writeAll("  latch plan <document.md>\n");
     try stderr_writer.interface.writeAll("  latch generate <document.latch.md>\n");
     try stderr_writer.interface.writeAll("  latch apply [--dir path] <document.md>\n");
     try stderr_writer.interface.flush();
