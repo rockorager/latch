@@ -106,10 +106,14 @@ fn runApply(allocator: std.mem.Allocator, args: []const []const u8) !void {
 fn printUsage() !void {
     var stderr_buffer: [1024]u8 = undefined;
     var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
-    try stderr_writer.interface.writeAll("latch: literate patch proof of concept\n\n");
-    try stderr_writer.interface.writeAll("usage:\n");
-    try stderr_writer.interface.writeAll("  latch draft <document.latch.md>\n");
-    try stderr_writer.interface.writeAll("  latch apply [--dir path] <document.md>\n");
+    try stderr_writer.interface.writeAll(
+        \\latch: literate patch tooling
+        \\
+        \\usage:
+        \\  latch draft <document.latch.md>
+        \\  latch apply [--dir path] <document.md>
+        \\
+    );
     try stderr_writer.interface.flush();
 }
 

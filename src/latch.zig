@@ -164,15 +164,19 @@ pub fn generateDocumentFromUnifiedDiff(allocator: std.mem.Allocator, diff: []con
 
     const patch_count = countGeneratedPatches(sections);
     try builder.writer(allocator).print(
-        "# Generated Latch\n\n" ++
-            "This document was generated from the current Git diff.\n" ++
-            "It captures {d} executable patch block{s} across {d} changed file{s}.\n\n" ++
-            "This draft is intentionally mechanical.\n" ++
-            "On the human pass, prefer narrative order over diff order.\n" ++
-            "Start with user-facing commands or API entrypoints, then docs and examples, " ++
-            "then internal machinery, and leave tests or proof points near the end.\n" ++
-            "Keep patch ids stable while moving sections.\n" ++
-            "Refine dependencies only when the narrative no longer matches the mechanical order.\n",
+        \\# Draft Latch Document
+        \\
+        \\This document was generated from the current Git diff. It captures {d}
+        \\executable patch block{s} across {d} changed file{s}.
+        \\
+        \\This draft is intentionally mechanical. On the human pass, prefer
+        \\narrative order over diff order: start with user-facing commands or
+        \\API entrypoints, then docs and examples, then internal machinery, and
+        \\leave tests or proof points near the end. Keep patch ids stable while
+        \\moving sections. Refine dependencies only when the narrative no longer
+        \\matches the mechanical order.
+        \\
+    ,
         .{
             patch_count,
             if (patch_count == 1) "" else "s",
@@ -186,7 +190,12 @@ pub fn generateDocumentFromUnifiedDiff(allocator: std.mem.Allocator, diff: []con
         defer allocator.free(base_slug);
 
         try builder.writer(allocator).print(
-            "\n## {s}\n\nThis section was generated from `{s}`.\n",
+            \\
+            \\## {s}
+            \\
+            \\This section was generated from `{s}`.
+            \\
+        ,
             .{ section.path, section.path },
         );
 
@@ -218,7 +227,12 @@ pub fn generateDocumentFromUnifiedDiff(allocator: std.mem.Allocator, diff: []con
             defer allocator.free(metadata);
 
             try builder.writer(allocator).print(
-                "\n### Hunk {d}\n\nThis hunk was generated mechanically from `{s}`.\n\n",
+                \\
+                \\### Hunk {d}
+                \\
+                \\This hunk was generated mechanically from `{s}`.
+                \\
+            ,
                 .{ hunk_index + 1, section.path },
             );
             try writeDiffFence(allocator, &builder, metadata, section.prelude, hunk.body);
