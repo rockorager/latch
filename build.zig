@@ -24,6 +24,16 @@ fn addUucodeImport(
     root_module.addImport("uucode", dep.module("uucode"));
 }
 
+fn addSkillOptionsImport(b: *std.Build, root_module: *std.Build.Module) void {
+    const skill_markdown = std.fs.cwd().readFileAlloc(b.allocator, "SKILL.md", 1024 * 1024) catch |err| {
+        std.debug.panic("failed to read SKILL.md: {s}", .{@errorName(err)});
+    };
+
+    const options = b.addOptions();
+    options.addOption([]const u8, "skill_markdown", skill_markdown);
+    root_module.addOptions("build_options", options);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -33,6 +43,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     addUucodeImport(b, exe_module, target, optimize);
+    addSkillOptionsImport(b, exe_module);
 
     const exe = b.addExecutable(.{
         .name = "latch",
@@ -57,6 +68,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     addUucodeImport(b, test_module, target, optimize);
+    addSkillOptionsImport(b, test_module);
     const exe_tests = b.addTest(.{
         .root_module = test_module,
     });

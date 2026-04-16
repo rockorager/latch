@@ -1,6 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const latch = @import("latch.zig");
+
+const skill_markdown = build_options.skill_markdown;
 
 pub fn main() void {
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
@@ -43,6 +46,10 @@ fn run(allocator: std.mem.Allocator, diagnostics: *latch.Diagnostic) !void {
     }
     if (std.mem.eql(u8, args[1], "apply")) {
         try runApply(allocator, args[2..], diagnostics);
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "skill")) {
+        try runSkill(args[2..]);
         return;
     }
     if (std.mem.eql(u8, args[1], "-h") or std.mem.eql(u8, args[1], "--help")) {
@@ -159,6 +166,23 @@ fn runApply(allocator: std.mem.Allocator, args: []const []const u8, diagnostics:
     try stdout_writer.interface.flush();
 }
 
+fn runSkill(args: []const []const u8) !void {
+    if (args.len == 1 and isHelpFlag(args[0])) {
+        try printSkillUsage();
+        return;
+    }
+    if (args.len != 0) return error.UnexpectedArgument;
+
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    try writeSkill(&stdout_writer.interface);
+    try stdout_writer.interface.flush();
+}
+
+fn writeSkill(writer: anytype) !void {
+    try writer.writeAll(skill_markdown);
+}
+
 fn printUsage() !void {
     var stderr_buffer: [1024]u8 = undefined;
     var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
@@ -172,16 +196,19 @@ fn printUsage() !void {
         \\  draft    Generate a Latch draft from stdin, a Git spec, or the
         \\           current worktree diff
         \\  apply    Apply executable diff fences from a Latch document
+        \\  skill    Print the checked-in Latch Codex skill
         \\
         \\EXAMPLES
         \\  latch draft -o change.latch.md
         \\  latch draft HEAD~1 -o change.latch.md
         \\  git diff | latch draft -o change.latch.md
         \\  latch apply change.latch.md
+        \\  latch skill
         \\
         \\LEARN MORE
         \\  latch draft --help
         \\  latch apply --help
+        \\  latch skill --help
         \\
     );
     try stderr_writer.interface.flush();
@@ -231,6 +258,25 @@ fn printApplyUsage() !void {
         \\EXAMPLES
         \\  latch apply change.latch.md
         \\  latch apply --dir /tmp/repo change.latch.md
+        \\
+    );
+    try stderr_writer.interface.flush();
+}
+
+fn printSkillUsage() !void {
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+    try stderr_writer.interface.writeAll(
+        \\Print the checked-in Latch Codex skill
+        \\
+        \\USAGE
+        \\  latch skill
+        \\
+        \\OPTIONS
+        \\  -h, --help            Show help for skill
+        \\
+        \\DETAILS
+        \\  Prints the repository's root SKILL.md to stdout.
         \\
     );
     try stderr_writer.interface.flush();
@@ -400,4 +446,16 @@ fn writeDiagnostic(writer: anytype, diagnostics: *const latch.Diagnostic) !void 
 
 test {
     _ = @import("latch.zig");
+}
+
+test "skill command prints embedded skill markdown" {
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+
+    try writeSkill(&writer.writer);
+
+    const output = try writer.toOwnedSlice();
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqualStrings(skill_markdown, output);
 }

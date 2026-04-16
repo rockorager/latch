@@ -12,6 +12,9 @@ That document is meant to be both readable and runnable. After the
 human pass, `latch apply` reads the executable `diff` fences and
 materializes the patch onto a target tree.
 
+`latch skill` prints the checked-in Codex skill for turning code changes
+into a Latch narrative.
+
 ## Example
 
 ````md
@@ -94,6 +97,12 @@ Apply a Latch document:
 
 ```sh
 latch apply change.latch.md
+```
+
+Print the repo skill:
+
+```sh
+latch skill
 ```
 
 ## Workflow
