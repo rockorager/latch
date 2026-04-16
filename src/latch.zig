@@ -114,7 +114,14 @@ pub const Document = struct {
 };
 
 pub fn generateDocumentFromGitDiff(allocator: std.mem.Allocator) ![]u8 {
-    const diff = try collectGitDiff(allocator);
+    const diff = try collectGitWorktreeDiff(allocator);
+    defer allocator.free(diff);
+
+    return generateDocumentFromUnifiedDiff(allocator, diff);
+}
+
+pub fn generateDocumentFromGitSpec(allocator: std.mem.Allocator, spec: []const u8) ![]u8 {
+    const diff = try collectGitSpecDiff(allocator, spec);
     defer allocator.free(diff);
 
     return generateDocumentFromUnifiedDiff(allocator, diff);
@@ -307,10 +314,21 @@ fn collectPatches(
     }
 }
 
-fn collectGitDiff(allocator: std.mem.Allocator) ![]u8 {
+fn collectGitWorktreeDiff(allocator: std.mem.Allocator) ![]u8 {
+    return runGitForDiff(allocator, &.{ "git", "diff", "--no-ext-diff", "HEAD" });
+}
+
+fn collectGitSpecDiff(allocator: std.mem.Allocator, spec: []const u8) ![]u8 {
+    if (looksLikeRevisionRange(spec)) {
+        return runGitForDiff(allocator, &.{ "git", "diff", "--no-ext-diff", spec });
+    }
+    return runGitForDiff(allocator, &.{ "git", "show", "--format=", "--no-ext-diff", spec });
+}
+
+fn runGitForDiff(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
     const result = try std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &.{ "git", "diff", "--no-ext-diff", "HEAD" },
+        .argv = argv,
         .max_output_bytes = 16 * 1024 * 1024,
     });
     defer allocator.free(result.stderr);
@@ -327,6 +345,10 @@ fn collectGitDiff(allocator: std.mem.Allocator) ![]u8 {
     }
     allocator.free(result.stdout);
     return error.GitDiffFailed;
+}
+
+fn looksLikeRevisionRange(spec: []const u8) bool {
+    return std.mem.indexOf(u8, spec, "..") != null;
 }
 
 fn parseDiffSections(allocator: std.mem.Allocator, diff: []const u8) ![]DiffSection {
@@ -715,4 +737,11 @@ test "generate document from unified diff" {
         std.mem.indexOf(u8, generated, "```diff id=src-main-zig-02 depends-on=src-main-zig-01") != null,
     );
     try std.testing.expect(std.mem.indexOf(u8, generated, "````diff id=readme-md-01") != null);
+}
+
+test "detects git revision ranges" {
+    try std.testing.expect(looksLikeRevisionRange("HEAD~2..HEAD"));
+    try std.testing.expect(looksLikeRevisionRange("main...feature"));
+    try std.testing.expect(!looksLikeRevisionRange("HEAD~2"));
+    try std.testing.expect(!looksLikeRevisionRange("feature-branch"));
 }

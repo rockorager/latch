@@ -53,20 +53,64 @@ fn run(allocator: std.mem.Allocator) !void {
 }
 
 fn runDraft(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    if (args.len != 1) return error.MissingOutputPath;
+    var output_path: ?[]const u8 = null;
+    var git_spec: ?[]const u8 = null;
 
-    const output_path = args[0];
-    const generated = try latch.generateDocumentFromGitDiff(allocator);
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+            index += 1;
+            if (index >= args.len) return error.MissingOutputPath;
+            output_path = args[index];
+            continue;
+        }
+        if (git_spec != null) return error.UnexpectedArgument;
+        git_spec = arg;
+    }
+
+    const stdin_file = std.fs.File.stdin();
+    const stdin_diff = stdin_diff: {
+        if (stdin_file.isTty()) break :stdin_diff null;
+        const data = try stdin_file.readToEndAlloc(allocator, 16 * 1024 * 1024);
+        if (data.len == 0) {
+            allocator.free(data);
+            break :stdin_diff null;
+        }
+        break :stdin_diff data;
+    };
+    defer if (stdin_diff) |diff| allocator.free(diff);
+
+    const has_stdin_input = stdin_diff != null;
+    if (has_stdin_input and git_spec != null) return error.ConflictingDraftInput;
+
+    const generated = generated: {
+        if (stdin_diff) |diff| {
+            break :generated try latch.generateDocumentFromUnifiedDiff(allocator, diff);
+        }
+        if (git_spec) |spec| {
+            break :generated try latch.generateDocumentFromGitSpec(allocator, spec);
+        }
+        break :generated try latch.generateDocumentFromGitDiff(allocator);
+    };
     defer allocator.free(generated);
 
-    try std.fs.cwd().writeFile(.{
-        .sub_path = output_path,
-        .data = generated,
-    });
+    if (output_path) |path| {
+        try std.fs.cwd().writeFile(.{
+            .sub_path = path,
+            .data = generated,
+        });
 
-    var stdout_buffer: [1024]u8 = undefined;
+        var stdout_buffer: [1024]u8 = undefined;
+        var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+        try stdout_writer.interface.print("generated {s}\n", .{path});
+        try stdout_writer.interface.flush();
+        return;
+    }
+
+    var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-    try stdout_writer.interface.print("generated {s}\n", .{output_path});
+    try stdout_writer.interface.writeAll(generated);
     try stdout_writer.interface.flush();
 }
 
@@ -110,8 +154,11 @@ fn printUsage() !void {
         \\latch: literate patch tooling
         \\
         \\usage:
-        \\  latch draft <document.latch.md>
+        \\  latch draft [git-spec] [-o document.latch.md]
         \\  latch apply [--dir path] <document.md>
+        \\
+        \\draft reads a unified diff from stdin when piped, otherwise uses
+        \\git-spec or the current worktree diff.
         \\
     );
     try stderr_writer.interface.flush();
@@ -124,16 +171,25 @@ fn reportError(err: anyerror) !void {
     switch (err) {
         error.InvalidCommand => {
             try stderr_writer.interface.writeAll("error: unknown command\n");
+            try stderr_writer.interface.flush();
             try printUsage();
             return;
         },
         error.MissingDocumentPath => {
             try stderr_writer.interface.writeAll("error: expected a document path\n");
+            try stderr_writer.interface.flush();
             try printUsage();
             return;
         },
         error.MissingOutputPath => {
-            try stderr_writer.interface.writeAll("error: expected an output path\n");
+            try stderr_writer.interface.writeAll("error: -o/--output requires a path\n");
+            try stderr_writer.interface.flush();
+            try printUsage();
+            return;
+        },
+        error.ConflictingDraftInput => {
+            try stderr_writer.interface.writeAll("error: choose stdin or a git-spec, not both\n");
+            try stderr_writer.interface.flush();
             try printUsage();
             return;
         },
