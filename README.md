@@ -1,7 +1,8 @@
 # Latch
 
 `latch` is a CLI for literate patches: Markdown documents that carry
-patch intent in prose and executable diffs in fenced code blocks.
+patch intent in prose and executable diffs in fenced code blocks. A
+Latch document is a literate patch.
 
 `latch draft` turns a diff into a first-pass Latch document. The draft
 keeps the full diff inline, assigns deterministic patch ids, and emits
@@ -135,43 +136,18 @@ Install it somewhere on `PATH`:
 zig build -Doptimize=ReleaseSafe install --prefix ~/.local
 ```
 
-## Document Format
+## Specification
 
-Latch treats any fenced code block whose info string starts with `diff`
-as executable. Extra fence metadata is parsed from `key=value` tokens
-after `diff`.
+Latch is both a CLI and a document format. The normative format and
+application rules live in `SPECIFICATION.md`.
 
-Example:
+Short version:
 
-````md
-```diff id=3f2a91c8 depends-on=1c0e51aa
-diff --git a/src/main.zig b/src/main.zig
-...
-```
-````
+- patch fences are fenced code blocks whose info string starts with
+  `diff`
+- supported metadata keys are `id`, `depends-on`, and `part`
+- `depends-on` controls apply order, not Markdown position
+- split patches reuse the same `id` with contiguous `part=1..N`
 
-### Supported Keys
-
-- `id=...`
-  Required for every executable patch. `id` names the logical patch that
-  `latch` orders and applies.
-- `depends-on=a,b,c`
-  Optional comma-separated patch dependencies. Apply order is computed
-  from dependencies, not Markdown position.
-- `part=N`
-  Optional positive integer used to split one logical patch across
-  multiple `diff` fences. Fences with the same `id` and contiguous
-  `part=1..N` are concatenated before apply. If `depends-on` is needed
-  on a split patch, it must appear on `part=1`.
-
-Unsupported metadata keys are rejected.
-
-### Apply Semantics
-
-- Every executable patch must have an `id`.
-- Repeated `id`s are only valid when every fragment uses `part=...`.
-- Split patches must use contiguous parts starting at `1`.
-- Apply order comes from `depends-on`, not document order.
-- Independent patches are applied in lexical `id` order.
-- Patch application currently shells out to
-  `git apply --unsafe-paths`.
+See `SPECIFICATION.md` for the full grammar, validation rules, assembly
+rules, and application semantics.
