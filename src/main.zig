@@ -39,6 +39,10 @@ fn run(allocator: std.mem.Allocator) !void {
         try runPlan(allocator, args[2..]);
         return;
     }
+    if (std.mem.eql(u8, args[1], "generate")) {
+        try runGenerate(allocator, args[2..]);
+        return;
+    }
     if (std.mem.eql(u8, args[1], "apply")) {
         try runApply(allocator, args[2..]);
         return;
@@ -86,6 +90,24 @@ fn runPlan(allocator: std.mem.Allocator, args: []const []const u8) !void {
     try stdout_writer.interface.flush();
 }
 
+fn runGenerate(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len != 1) return error.MissingOutputPath;
+
+    const output_path = args[0];
+    const generated = try latch.generateDocumentFromGitDiff(allocator);
+    defer allocator.free(generated);
+
+    try std.fs.cwd().writeFile(.{
+        .sub_path = output_path,
+        .data = generated,
+    });
+
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    try stdout_writer.interface.print("generated {s}\n", .{output_path});
+    try stdout_writer.interface.flush();
+}
+
 fn runApply(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var target_dir: []const u8 = ".";
     var document_path: ?[]const u8 = null;
@@ -125,6 +147,7 @@ fn printUsage() !void {
     try stderr_writer.interface.writeAll("latch: literate patch proof of concept\n\n");
     try stderr_writer.interface.writeAll("usage:\n");
     try stderr_writer.interface.writeAll("  latch plan <document.md>\n");
+    try stderr_writer.interface.writeAll("  latch generate <document.latch.md>\n");
     try stderr_writer.interface.writeAll("  latch apply [--dir path] <document.md>\n");
     try stderr_writer.interface.flush();
 }
@@ -141,6 +164,11 @@ fn reportError(err: anyerror) !void {
         },
         error.MissingDocumentPath => {
             try stderr_writer.interface.writeAll("error: expected a document path\n");
+            try printUsage();
+            return;
+        },
+        error.MissingOutputPath => {
+            try stderr_writer.interface.writeAll("error: expected an output path\n");
             try printUsage();
             return;
         },

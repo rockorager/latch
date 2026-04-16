@@ -11,6 +11,17 @@ pub const Patch = struct {
     end_line: usize,
 };
 
+const DiffSection = struct {
+    path: []const u8,
+    prelude: []const u8,
+    hunks: []HunkSection,
+    body: []const u8,
+};
+
+const HunkSection = struct {
+    body: []const u8,
+};
+
 pub const Document = struct {
     allocator: std.mem.Allocator,
     source: []u8,
@@ -102,6 +113,13 @@ pub const Document = struct {
     }
 };
 
+pub fn generateDocumentFromGitDiff(allocator: std.mem.Allocator) ![]u8 {
+    const diff = try collectGitDiff(allocator);
+    defer allocator.free(diff);
+
+    return generateDocumentFromUnifiedDiff(allocator, diff);
+}
+
 pub fn loadDocumentFromFile(allocator: std.mem.Allocator, path: []const u8) !Document {
     const source = try std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024);
     errdefer allocator.free(source);
@@ -130,6 +148,84 @@ pub fn parseDocument(allocator: std.mem.Allocator, owned_source: []u8) !Document
         .markdown_document = markdown_document,
         .patches = try patches.toOwnedSlice(allocator),
     };
+}
+
+pub fn generateDocumentFromUnifiedDiff(allocator: std.mem.Allocator, diff: []const u8) ![]u8 {
+    const sections = try parseDiffSections(allocator, diff);
+    defer freeDiffSections(allocator, sections);
+
+    if (sections.len == 0) {
+        logError("no git diff found to generate from", .{});
+        return error.NoGitDiff;
+    }
+
+    var builder: std.ArrayList(u8) = .empty;
+    defer builder.deinit(allocator);
+
+    const patch_count = countGeneratedPatches(sections);
+    try builder.writer(allocator).print(
+        "# Generated Latch\n\n" ++
+            "This document was generated from the current Git diff.\n" ++
+            "It captures {d} executable patch block{s} across {d} changed file{s}.\n\n" ++
+            "This draft is intentionally mechanical.\n" ++
+            "On the human pass, prefer narrative order over diff order.\n" ++
+            "Start with user-facing commands or API entrypoints, then docs and examples, " ++
+            "then internal machinery, and leave tests or proof points near the end.\n" ++
+            "Keep patch ids stable while moving sections.\n" ++
+            "Refine dependencies only when the narrative no longer matches the mechanical order.\n",
+        .{
+            patch_count,
+            if (patch_count == 1) "" else "s",
+            sections.len,
+            if (sections.len == 1) "" else "s",
+        },
+    );
+
+    for (sections) |section| {
+        const base_slug = try slugify(allocator, section.path);
+        defer allocator.free(base_slug);
+
+        try builder.writer(allocator).print(
+            "\n## {s}\n\nThis section was generated from `{s}`.\n",
+            .{ section.path, section.path },
+        );
+
+        if (section.hunks.len == 0) {
+            const metadata = try std.fmt.allocPrint(allocator, "id={s}-01", .{base_slug});
+            defer allocator.free(metadata);
+            try writeDiffFence(
+                allocator,
+                &builder,
+                metadata,
+                section.body,
+                "",
+            );
+            continue;
+        }
+
+        for (section.hunks, 0..) |hunk, hunk_index| {
+            const patch_id = try std.fmt.allocPrint(allocator, "{s}-{d:0>2}", .{ base_slug, hunk_index + 1 });
+            defer allocator.free(patch_id);
+
+            const metadata = if (hunk_index == 0)
+                try std.fmt.allocPrint(allocator, "id={s}", .{patch_id})
+            else
+                try std.fmt.allocPrint(
+                    allocator,
+                    "id={s} depends-on={s}-{d:0>2}",
+                    .{ patch_id, base_slug, hunk_index },
+                );
+            defer allocator.free(metadata);
+
+            try builder.writer(allocator).print(
+                "\n### Hunk {d}\n\nThis hunk was generated mechanically from `{s}`.\n\n",
+                .{ hunk_index + 1, section.path },
+            );
+            try writeDiffFence(allocator, &builder, metadata, section.prelude, hunk.body);
+        }
+    }
+
+    return builder.toOwnedSlice(allocator);
 }
 
 pub fn applyPatches(
@@ -204,6 +300,205 @@ fn collectPatches(
             try collectPatches(allocator, source, node.children, patches);
         }
     }
+}
+
+fn collectGitDiff(allocator: std.mem.Allocator) ![]u8 {
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "git", "diff", "--no-ext-diff", "HEAD" },
+        .max_output_bytes = 16 * 1024 * 1024,
+    });
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .Exited => |code| {
+            if (code == 0) return result.stdout;
+        },
+        else => {},
+    }
+
+    if (result.stderr.len != 0) {
+        logError("{s}", .{result.stderr});
+    }
+    allocator.free(result.stdout);
+    return error.GitDiffFailed;
+}
+
+fn parseDiffSections(allocator: std.mem.Allocator, diff: []const u8) ![]DiffSection {
+    var sections: std.ArrayList(DiffSection) = .empty;
+    errdefer {
+        for (sections.items) |section| {
+            allocator.free(section.hunks);
+        }
+        sections.deinit(allocator);
+    }
+
+    var line_start: usize = 0;
+    var current_start: ?usize = null;
+    while (line_start < diff.len) {
+        const line_end = nextLineEnd(diff, line_start);
+        const line = diff[line_start..line_end];
+        if (std.mem.startsWith(u8, line, "diff --git ")) {
+            if (current_start) |start| {
+                try sections.append(allocator, try parseDiffSection(allocator, diff[start..line_start]));
+            }
+            current_start = line_start;
+        }
+        line_start = line_end;
+    }
+
+    if (current_start) |start| {
+        try sections.append(allocator, try parseDiffSection(allocator, diff[start..]));
+    }
+
+    return sections.toOwnedSlice(allocator);
+}
+
+fn freeDiffSections(allocator: std.mem.Allocator, sections: []DiffSection) void {
+    for (sections) |section| {
+        allocator.free(section.hunks);
+    }
+    allocator.free(sections);
+}
+
+fn parseDiffSection(allocator: std.mem.Allocator, section: []const u8) !DiffSection {
+    const path = parseSectionPath(section) orelse return error.InvalidDiff;
+
+    var line_start: usize = 0;
+    var first_hunk_start: ?usize = null;
+    var hunk_count: usize = 0;
+    while (line_start < section.len) {
+        const line_end = nextLineEnd(section, line_start);
+        const line = section[line_start..line_end];
+        if (std.mem.startsWith(u8, line, "@@ ")) {
+            if (first_hunk_start == null) first_hunk_start = line_start;
+            hunk_count += 1;
+        }
+        line_start = line_end;
+    }
+
+    if (first_hunk_start == null) {
+        return .{
+            .path = path,
+            .prelude = "",
+            .hunks = &.{},
+            .body = section,
+        };
+    }
+
+    const prelude = section[0..first_hunk_start.?];
+    var hunks = try allocator.alloc(HunkSection, hunk_count);
+    errdefer allocator.free(hunks);
+
+    var hunk_index: usize = 0;
+    var hunk_start = first_hunk_start.?;
+    line_start = first_hunk_start.? + 1;
+    while (line_start < section.len) {
+        const line_end = nextLineEnd(section, line_start);
+        const line = section[line_start..line_end];
+        if (std.mem.startsWith(u8, line, "@@ ")) {
+            hunks[hunk_index] = .{ .body = section[hunk_start..line_start] };
+            hunk_index += 1;
+            hunk_start = line_start;
+        }
+        line_start = line_end;
+    }
+    hunks[hunk_index] = .{ .body = section[hunk_start..] };
+
+    return .{
+        .path = path,
+        .prelude = prelude,
+        .hunks = hunks,
+        .body = section,
+    };
+}
+
+fn countGeneratedPatches(sections: []const DiffSection) usize {
+    var count: usize = 0;
+    for (sections) |section| {
+        count += if (section.hunks.len == 0) 1 else section.hunks.len;
+    }
+    return count;
+}
+
+fn parseSectionPath(section: []const u8) ?[]const u8 {
+    const first_line_end = std.mem.indexOfScalar(u8, section, '\n') orelse section.len;
+    const first_line = std.mem.trimEnd(u8, section[0..first_line_end], "\r");
+    const prefix = "diff --git a/";
+    if (!std.mem.startsWith(u8, first_line, prefix)) return null;
+
+    const b_marker = " b/";
+    const path_start = std.mem.indexOf(u8, first_line, b_marker) orelse return null;
+    return first_line[path_start + b_marker.len ..];
+}
+
+fn nextLineEnd(source: []const u8, start: usize) usize {
+    const newline = std.mem.indexOfScalarPos(u8, source, start, '\n') orelse return source.len;
+    return newline + 1;
+}
+
+fn writeDiffFence(
+    allocator: std.mem.Allocator,
+    builder: *std.ArrayList(u8),
+    metadata: []const u8,
+    prefix: []const u8,
+    body: []const u8,
+) !void {
+    const fence_len = requiredBacktickFenceLen(prefix, body);
+    try builder.appendNTimes(allocator, '`', fence_len);
+    try builder.writer(allocator).print("diff {s}\n", .{metadata});
+    try builder.writer(allocator).writeAll(prefix);
+    try builder.writer(allocator).writeAll(body);
+    if (!std.mem.endsWith(u8, body, "\n") and !std.mem.endsWith(u8, prefix, "\n")) {
+        try builder.append(allocator, '\n');
+    } else if (!std.mem.endsWith(u8, body, "\n") and body.len != 0) {
+        try builder.append(allocator, '\n');
+    }
+    try builder.appendNTimes(allocator, '`', fence_len);
+    try builder.append(allocator, '\n');
+}
+
+fn requiredBacktickFenceLen(prefix: []const u8, body: []const u8) usize {
+    const max_run = @max(maxBacktickRun(prefix), maxBacktickRun(body));
+    return @max(@as(usize, 3), max_run + 1);
+}
+
+fn maxBacktickRun(source: []const u8) usize {
+    var best: usize = 0;
+    var current: usize = 0;
+    for (source) |char| {
+        if (char == '`') {
+            current += 1;
+            best = @max(best, current);
+        } else {
+            current = 0;
+        }
+    }
+    return best;
+}
+
+fn slugify(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+
+    var last_was_dash = false;
+    for (value) |char| {
+        if (std.ascii.isAlphanumeric(char)) {
+            try out.append(allocator, std.ascii.toLower(char));
+            last_was_dash = false;
+            continue;
+        }
+        if (!last_was_dash) {
+            try out.append(allocator, '-');
+            last_was_dash = true;
+        }
+    }
+
+    if (out.items.len == 0) {
+        try out.appendSlice(allocator, "patch");
+    }
+
+    return out.toOwnedSlice(allocator);
 }
 
 fn parsePatchNode(
@@ -384,4 +679,43 @@ test "detects dependency cycles" {
     defer document.deinit();
 
     try std.testing.expectError(error.DependencyCycle, document.orderedPatchIndices(std.testing.allocator));
+}
+
+test "generate document from unified diff" {
+    const diff =
+        \\diff --git a/src/main.zig b/src/main.zig
+        \\index 1111111..2222222 100644
+        \\--- a/src/main.zig
+        \\+++ b/src/main.zig
+        \\@@ -1,3 +1,4 @@
+        \\ const std = @import("std");
+        \\+const builtin = @import("builtin");
+        \\ const latch = @import("latch.zig");
+        \\ 
+        \\@@ -10,3 +11,4 @@ pub fn main() void {
+        \\     run() catch |err| {
+        \\+        _ = err;
+        \\     };
+        \\ }
+        \\
+        \\diff --git a/README.md b/README.md
+        \\index 3333333..4444444 100644
+        \\--- a/README.md
+        \\+++ b/README.md
+        \\@@ -1,4 +1,5 @@
+        \\ # Latch
+        \\ ```
+        \\+Generated docs.
+        \\ ```
+        \\
+    ;
+
+    const generated = try generateDocumentFromUnifiedDiff(std.testing.allocator, diff);
+    defer std.testing.allocator.free(generated);
+
+    try std.testing.expect(std.mem.indexOf(u8, generated, "```diff id=src-main-zig-01") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, generated, "```diff id=src-main-zig-02 depends-on=src-main-zig-01") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, generated, "````diff id=readme-md-01") != null);
 }

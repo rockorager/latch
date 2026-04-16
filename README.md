@@ -42,9 +42,15 @@ diff --git a/hello.txt b/hello.txt
 - If multiple patches are otherwise independent, they are applied in lexical `id` order.
 - Patch application currently shells out to `git apply --unsafe-paths`.
 
+## Workflow
+
+`latch generate` turns the current Git diff into a first-pass `.latch.md`.
+The generated document is intentionally mechanical: it preserves fine-grained hunks, inserts stable patch ids, and gives you prose stubs to edit into a coherent story.
+
 ## Usage
 
 ```sh
 zig build run -- plan examples/demo.lpatch.md
+zig build run -- generate examples/change.latch.md
 zig build run -- apply --dir examples/demo-target examples/demo.lpatch.md
 ```
