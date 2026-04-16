@@ -150,10 +150,36 @@ const DiffSection = struct {
     prelude: []const u8,
     hunks: []HunkSection,
     body: []const u8,
+    additions: usize,
+    deletions: usize,
+    kind: FileChangeKind,
 };
 
 const HunkSection = struct {
     body: []const u8,
+};
+
+const FileChangeKind = enum {
+    modified,
+    created,
+    deleted,
+};
+
+const DiffLineStats = struct {
+    additions: usize = 0,
+    deletions: usize = 0,
+    kind: FileChangeKind = .modified,
+};
+
+const PathEntry = struct {
+    section: *const DiffSection,
+    segments: []const []const u8,
+};
+
+const TreeLayout = struct {
+    max_label_width: usize = 0,
+    max_add_digits: usize = 1,
+    max_del_digits: usize = 1,
 };
 
 pub const Document = struct {
@@ -411,6 +437,8 @@ pub fn generateDocumentFromUnifiedDiffWithDiagnostics(
         \\
     , .{});
 
+    try writeGeneratedTreeOverview(allocator, &builder, sections);
+
     for (sections) |section| {
         var section_patch_ids: std.ArrayList([]const u8) = .empty;
         defer {
@@ -444,7 +472,6 @@ pub fn generateDocumentFromUnifiedDiffWithDiagnostics(
             \\## {s}
             \\
             \\This section was generated from `{s}`.
-            \\
             \\
         ,
             .{ section.path, section.path },
@@ -892,11 +919,15 @@ fn parseDiffSection(
     }
 
     if (first_hunk_start == null) {
+        const stats = countDiffLineStats(section);
         return .{
             .path = path,
             .prelude = "",
             .hunks = &.{},
             .body = section,
+            .additions = stats.additions,
+            .deletions = stats.deletions,
+            .kind = stats.kind,
         };
     }
 
@@ -919,12 +950,37 @@ fn parseDiffSection(
     }
     hunks[hunk_index] = .{ .body = section[hunk_start..] };
 
+    const stats = countDiffLineStats(section);
+
     return .{
         .path = path,
         .prelude = prelude,
         .hunks = hunks,
         .body = section,
+        .additions = stats.additions,
+        .deletions = stats.deletions,
+        .kind = stats.kind,
     };
+}
+
+fn countDiffLineStats(section: []const u8) DiffLineStats {
+    var stats: DiffLineStats = .{};
+    var line_start: usize = 0;
+    while (line_start < section.len) {
+        const line_end = nextLineEnd(section, line_start);
+        const line = std.mem.trimEnd(u8, section[line_start..line_end], "\r\n");
+        if (std.mem.eql(u8, line, "--- /dev/null") or std.mem.startsWith(u8, line, "new file mode ")) {
+            stats.kind = .created;
+        } else if (std.mem.eql(u8, line, "+++ /dev/null") or std.mem.startsWith(u8, line, "deleted file mode ")) {
+            stats.kind = .deleted;
+        } else if (std.mem.startsWith(u8, line, "+") and !std.mem.startsWith(u8, line, "+++")) {
+            stats.additions += 1;
+        } else if (std.mem.startsWith(u8, line, "-") and !std.mem.startsWith(u8, line, "---")) {
+            stats.deletions += 1;
+        }
+        line_start = line_end;
+    }
+    return stats;
 }
 
 fn parseSectionPath(section: []const u8) ?[]const u8 {
@@ -941,6 +997,205 @@ fn parseSectionPath(section: []const u8) ?[]const u8 {
 fn nextLineEnd(source: []const u8, start: usize) usize {
     const newline = std.mem.indexOfScalarPos(u8, source, start, '\n') orelse return source.len;
     return newline + 1;
+}
+
+fn writeGeneratedTreeOverview(
+    allocator: std.mem.Allocator,
+    builder: *std.ArrayList(u8),
+    sections: []const DiffSection,
+) !void {
+    var entries = try allocator.alloc(PathEntry, sections.len);
+    defer {
+        for (entries) |entry| {
+            allocator.free(entry.segments);
+        }
+        allocator.free(entries);
+    }
+
+    var total_additions: usize = 0;
+    var total_deletions: usize = 0;
+    var layout: TreeLayout = .{};
+
+    for (sections, 0..) |*section, index| {
+        entries[index] = .{
+            .section = section,
+            .segments = try splitPathSegments(allocator, section.path),
+        };
+        total_additions += section.additions;
+        total_deletions += section.deletions;
+        layout.max_add_digits = @max(layout.max_add_digits, countDecimalDigits(section.additions));
+        layout.max_del_digits = @max(layout.max_del_digits, countDecimalDigits(section.deletions));
+    }
+
+    std.sort.heap(PathEntry, entries, {}, struct {
+        fn lessThan(_: void, lhs: PathEntry, rhs: PathEntry) bool {
+            return std.mem.lessThan(u8, lhs.section.path, rhs.section.path);
+        }
+    }.lessThan);
+
+    computeTreeLayout(entries, 0, 0, &layout);
+
+    try builder.writer(allocator).writeAll(
+        \\
+        \\## Tree
+        \\
+        \\```text
+        \\.
+        \\
+    );
+    try writeTreeLevel(allocator, builder, entries, 0, "", 0, &layout);
+    try builder.writer(allocator).writeAll(
+        \\```
+        \\
+    );
+    try builder.writer(allocator).print(
+        "{d} {s} changed, {d} insertion{s}(+), {d} deletion{s}(-)\n",
+        .{
+            sections.len,
+            if (sections.len == 1) "file" else "files",
+            total_additions,
+            if (total_additions == 1) "" else "s",
+            total_deletions,
+            if (total_deletions == 1) "" else "s",
+        },
+    );
+}
+
+fn splitPathSegments(allocator: std.mem.Allocator, path: []const u8) ![]const []const u8 {
+    var count: usize = 1;
+    for (path) |char| {
+        if (char == '/') count += 1;
+    }
+
+    var segments = try allocator.alloc([]const u8, count);
+    var start: usize = 0;
+    var index: usize = 0;
+    for (path, 0..) |char, i| {
+        if (char == '/') {
+            segments[index] = path[start..i];
+            index += 1;
+            start = i + 1;
+        }
+    }
+    segments[index] = path[start..];
+    return segments;
+}
+
+fn computeTreeLayout(entries: []const PathEntry, depth: usize, prefix_width: usize, layout: *TreeLayout) void {
+    var start: usize = 0;
+    while (start < entries.len) {
+        const name = entries[start].segments[depth];
+        var end = start + 1;
+        while (end < entries.len and std.mem.eql(u8, entries[end].segments[depth], name)) {
+            end += 1;
+        }
+
+        if (end - start == 1 and depth + 1 == entries[start].segments.len) {
+            const label_width = prefix_width + 4 + name.len;
+            layout.max_label_width = @max(layout.max_label_width, label_width);
+        } else {
+            computeTreeLayout(entries[start..end], depth + 1, prefix_width + 4, layout);
+        }
+        start = end;
+    }
+}
+
+fn writeTreeLevel(
+    allocator: std.mem.Allocator,
+    builder: *std.ArrayList(u8),
+    entries: []const PathEntry,
+    depth: usize,
+    prefix: []const u8,
+    prefix_width: usize,
+    layout: *const TreeLayout,
+) !void {
+    var start: usize = 0;
+    while (start < entries.len) {
+        const name = entries[start].segments[depth];
+        var end = start + 1;
+        while (end < entries.len and std.mem.eql(u8, entries[end].segments[depth], name)) {
+            end += 1;
+        }
+
+        const is_last = end == entries.len;
+        const connector = if (is_last) "└── " else "├── ";
+        if (end - start == 1 and depth + 1 == entries[start].segments.len) {
+            try writeTreeLeaf(
+                allocator,
+                builder,
+                prefix,
+                connector,
+                prefix_width,
+                name,
+                entries[start].section,
+                layout,
+            );
+        } else {
+            try builder.writer(allocator).print("{s}{s}{s}\n", .{ prefix, connector, name });
+            const child_prefix = if (is_last) "    " else "│   ";
+            const next_prefix = try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, child_prefix });
+            defer allocator.free(next_prefix);
+            try writeTreeLevel(
+                allocator,
+                builder,
+                entries[start..end],
+                depth + 1,
+                next_prefix,
+                prefix_width + 4,
+                layout,
+            );
+        }
+        start = end;
+    }
+}
+
+fn writeTreeLeaf(
+    allocator: std.mem.Allocator,
+    builder: *std.ArrayList(u8),
+    prefix: []const u8,
+    connector: []const u8,
+    prefix_width: usize,
+    name: []const u8,
+    section: *const DiffSection,
+    layout: *const TreeLayout,
+) !void {
+    try builder.writer(allocator).print("{s}{s}{s}", .{ prefix, connector, name });
+
+    const label_width = prefix_width + 4 + name.len;
+    const padding = layout.max_label_width - label_width + 2;
+    try builder.appendNTimes(allocator, ' ', padding);
+
+    try builder.append(allocator, '+');
+    try builder.appendNTimes(
+        allocator,
+        ' ',
+        layout.max_add_digits - countDecimalDigits(section.additions),
+    );
+    try builder.writer(allocator).print("{d}", .{section.additions});
+    try builder.append(allocator, ' ');
+    try builder.append(allocator, '-');
+    try builder.appendNTimes(
+        allocator,
+        ' ',
+        layout.max_del_digits - countDecimalDigits(section.deletions),
+    );
+    try builder.writer(allocator).print("{d}", .{section.deletions});
+
+    switch (section.kind) {
+        .created => try builder.writer(allocator).writeAll("  (created)"),
+        .deleted => try builder.writer(allocator).writeAll("  (deleted)"),
+        .modified => {},
+    }
+    try builder.append(allocator, '\n');
+}
+
+fn countDecimalDigits(value: usize) usize {
+    var digits: usize = 1;
+    var remaining = value;
+    while (remaining >= 10) : (remaining /= 10) {
+        digits += 1;
+    }
+    return digits;
 }
 
 fn writeDiffFence(
@@ -1414,6 +1669,10 @@ test "generate document from unified diff" {
     try std.testing.expectEqual(@as(usize, 8), document.patches[0].id.len);
     try std.testing.expectEqual(@as(usize, 8), document.patches[1].id.len);
     try std.testing.expectEqual(@as(usize, 8), document.patches[2].id.len);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "## Tree\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "├── README.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "└── src\n    └── main.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "2 files changed, 3 insertions(+), 0 deletions(-)") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated, "```diff id=") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated, "````diff id=") != null);
 }
@@ -1453,4 +1712,36 @@ test "disambiguates duplicate generated patch ids" {
     try std.testing.expectEqual(@as(usize, 8), document.patches[0].id.len);
     try std.testing.expect(std.mem.startsWith(u8, document.patches[1].id, document.patches[0].id));
     try std.testing.expect(std.mem.endsWith(u8, document.patches[1].id, "-2"));
+}
+
+test "generate document includes created and deleted markers in tree overview" {
+    const diff =
+        \\diff --git a/LICENSE b/LICENSE
+        \\new file mode 100644
+        \\index 0000000..1111111
+        \\--- /dev/null
+        \\+++ b/LICENSE
+        \\@@ -0,0 +1,2 @@
+        \\+MIT License
+        \\+Copyright (c) 2026 Tim Culverhouse
+        \\
+        \\diff --git a/src/old.zig b/src/old.zig
+        \\deleted file mode 100644
+        \\index 2222222..0000000
+        \\--- a/src/old.zig
+        \\+++ /dev/null
+        \\@@ -1,2 +0,0 @@
+        \\-const old = true;
+        \\-pub fn old() void {}
+        \\
+    ;
+
+    const generated = try generateDocumentFromUnifiedDiff(std.testing.allocator, diff);
+    defer std.testing.allocator.free(generated);
+
+    try std.testing.expect(std.mem.indexOf(u8, generated, "├── LICENSE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "(created)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "└── src\n    └── old.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "(deleted)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "2 files changed, 2 insertions(+), 2 deletions(-)") != null);
 }
