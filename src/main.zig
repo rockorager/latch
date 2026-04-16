@@ -55,6 +55,11 @@ fn run(allocator: std.mem.Allocator, diagnostics: *latch.Diagnostic) !void {
 }
 
 fn runDraft(allocator: std.mem.Allocator, args: []const []const u8, diagnostics: *latch.Diagnostic) !void {
+    if (args.len == 1 and isHelpFlag(args[0])) {
+        try printDraftUsage();
+        return;
+    }
+
     var output_path: ?[]const u8 = null;
     var git_spec: ?[]const u8 = null;
 
@@ -117,6 +122,11 @@ fn runDraft(allocator: std.mem.Allocator, args: []const []const u8, diagnostics:
 }
 
 fn runApply(allocator: std.mem.Allocator, args: []const []const u8, diagnostics: *latch.Diagnostic) !void {
+    if (args.len == 1 and isHelpFlag(args[0])) {
+        try printApplyUsage();
+        return;
+    }
+
     var target_dir: []const u8 = ".";
     var document_path: ?[]const u8 = null;
 
@@ -153,17 +163,81 @@ fn printUsage() !void {
     var stderr_buffer: [1024]u8 = undefined;
     var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
     try stderr_writer.interface.writeAll(
-        \\latch: literate patch tooling
+        \\Literate patch tooling
         \\
-        \\usage:
-        \\  latch draft [git-spec] [-o document.latch.md]
-        \\  latch apply [--dir path] <document.md>
+        \\USAGE
+        \\  latch <command> [options]
         \\
-        \\draft reads a unified diff from stdin when piped, otherwise uses
-        \\git-spec or the current worktree diff.
+        \\COMMANDS
+        \\  draft    Generate a Latch draft from stdin, a Git spec, or the
+        \\           current worktree diff
+        \\  apply    Apply executable diff fences from a Latch document
+        \\
+        \\EXAMPLES
+        \\  latch draft -o change.latch.md
+        \\  latch draft HEAD~1 -o change.latch.md
+        \\  git diff | latch draft -o change.latch.md
+        \\  latch apply change.latch.md
+        \\
+        \\LEARN MORE
+        \\  latch draft --help
+        \\  latch apply --help
         \\
     );
     try stderr_writer.interface.flush();
+}
+
+fn printDraftUsage() !void {
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+    try stderr_writer.interface.writeAll(
+        \\Generate a Latch draft from a diff
+        \\
+        \\USAGE
+        \\  latch draft [git-spec] [-o document.latch.md]
+        \\
+        \\OPTIONS
+        \\  -o, --output <file>   Write the draft to a file instead of stdout
+        \\  -h, --help            Show help for draft
+        \\
+        \\DETAILS
+        \\  Reads a unified diff from stdin when piped, otherwise uses
+        \\  git-spec or the current worktree diff.
+        \\
+        \\EXAMPLES
+        \\  latch draft
+        \\  latch draft -o change.latch.md
+        \\  latch draft HEAD~1 -o change.latch.md
+        \\  latch draft main..HEAD
+        \\  git diff | latch draft -o change.latch.md
+        \\
+    );
+    try stderr_writer.interface.flush();
+}
+
+fn printApplyUsage() !void {
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+    try stderr_writer.interface.writeAll(
+        \\Apply executable diff fences from a Latch document
+        \\
+        \\USAGE
+        \\  latch apply [--dir path] <document.md>
+        \\
+        \\OPTIONS
+        \\  --dir <path>          Apply patches relative to a target directory
+        \\  -h, --help            Show help for apply
+        \\
+        \\EXAMPLES
+        \\  latch apply change.latch.md
+        \\  latch apply --dir /tmp/repo change.latch.md
+        \\
+    );
+    try stderr_writer.interface.flush();
+}
+
+fn isHelpFlag(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help");
 }
 
 fn reportError(err: anyerror, diagnostics: *const latch.Diagnostic) !void {
