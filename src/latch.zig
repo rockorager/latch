@@ -394,10 +394,12 @@ pub fn generateDocumentFromUnifiedDiffWithDiagnostics(
         \\narrative order, rewrite the headings and prose, and keep the diff
         \\fences executable.
         \\
-        \\Move from user-facing behavior to docs and examples, then internal
-        \\machinery, and leave tests or proof points near the end. Keep patch
-        \\ids stable while moving sections. Refine dependencies only when the
-        \\narrative no longer matches the mechanical order.
+        \\Start with the clearest explanation of behavior, whether that is
+        \\user-facing code, docs, or tests, then move into the internal
+        \\machinery. Leave tests or proof points near the end unless they
+        \\best explain the change up front. Keep patch ids stable while
+        \\moving sections. Refine dependencies only when the narrative no
+        \\longer matches the mechanical order.
         \\
         \\To split one logical patch across multiple diff fences, keep the
         \\same id on each fence and add part=1, part=2, and so on. Latch
