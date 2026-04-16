@@ -169,6 +169,9 @@ pub fn generateDocumentFromUnifiedDiff(allocator: std.mem.Allocator, diff: []con
     var builder: std.ArrayList(u8) = .empty;
     defer builder.deinit(allocator);
 
+    var seen_patch_ids = std.AutoHashMap(u32, usize).init(allocator);
+    defer seen_patch_ids.deinit();
+
     try builder.writer(allocator).print(
         \\# Draft Latch Document
         \\
@@ -187,8 +190,32 @@ pub fn generateDocumentFromUnifiedDiff(allocator: std.mem.Allocator, diff: []con
     , .{});
 
     for (sections) |section| {
-        const base_slug = try slugify(allocator, section.path);
-        defer allocator.free(base_slug);
+        var section_patch_ids: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (section_patch_ids.items) |patch_id| {
+                allocator.free(patch_id);
+            }
+            section_patch_ids.deinit(allocator);
+        }
+
+        if (section.hunks.len == 0) {
+            try section_patch_ids.append(
+                allocator,
+                try allocateGeneratedPatchId(allocator, section.path, section.body, &seen_patch_ids),
+            );
+        } else {
+            for (section.hunks) |hunk| {
+                try section_patch_ids.append(
+                    allocator,
+                    try allocateGeneratedPatchId(
+                        allocator,
+                        section.path,
+                        generatedPatchIdentityBody(hunk.body),
+                        &seen_patch_ids,
+                    ),
+                );
+            }
+        }
 
         try builder.writer(allocator).print(
             \\
@@ -201,7 +228,7 @@ pub fn generateDocumentFromUnifiedDiff(allocator: std.mem.Allocator, diff: []con
         );
 
         if (section.hunks.len == 0) {
-            const metadata = try std.fmt.allocPrint(allocator, "id={s}-01", .{base_slug});
+            const metadata = try std.fmt.allocPrint(allocator, "id={s}", .{section_patch_ids.items[0]});
             defer allocator.free(metadata);
             try writeDiffFence(
                 allocator,
@@ -214,16 +241,13 @@ pub fn generateDocumentFromUnifiedDiff(allocator: std.mem.Allocator, diff: []con
         }
 
         for (section.hunks, 0..) |hunk, hunk_index| {
-            const patch_id = try std.fmt.allocPrint(allocator, "{s}-{d:0>2}", .{ base_slug, hunk_index + 1 });
-            defer allocator.free(patch_id);
-
             const metadata = if (hunk_index == 0)
-                try std.fmt.allocPrint(allocator, "id={s}", .{patch_id})
+                try std.fmt.allocPrint(allocator, "id={s}", .{section_patch_ids.items[hunk_index]})
             else
                 try std.fmt.allocPrint(
                     allocator,
-                    "id={s} depends-on={s}-{d:0>2}",
-                    .{ patch_id, base_slug, hunk_index },
+                    "id={s} depends-on={s}",
+                    .{ section_patch_ids.items[hunk_index], section_patch_ids.items[hunk_index - 1] },
                 );
             defer allocator.free(metadata);
 
@@ -499,28 +523,35 @@ fn maxBacktickRun(source: []const u8) usize {
     return best;
 }
 
-fn slugify(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
-
-    var last_was_dash = false;
-    for (value) |char| {
-        if (std.ascii.isAlphanumeric(char)) {
-            try out.append(allocator, std.ascii.toLower(char));
-            last_was_dash = false;
-            continue;
-        }
-        if (!last_was_dash) {
-            try out.append(allocator, '-');
-            last_was_dash = true;
-        }
+fn allocateGeneratedPatchId(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    diff_body: []const u8,
+    seen_patch_ids: *std.AutoHashMap(u32, usize),
+) ![]u8 {
+    const hash = hashGeneratedPatch(path, diff_body);
+    const gop = try seen_patch_ids.getOrPut(hash);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = 1;
+        return std.fmt.allocPrint(allocator, "{x:0>8}", .{hash});
     }
 
-    if (out.items.len == 0) {
-        try out.appendSlice(allocator, "patch");
-    }
+    gop.value_ptr.* += 1;
+    return std.fmt.allocPrint(allocator, "{x:0>8}-{d}", .{ hash, gop.value_ptr.* });
+}
 
-    return out.toOwnedSlice(allocator);
+fn hashGeneratedPatch(path: []const u8, diff_body: []const u8) u32 {
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(path);
+    hasher.update("\n");
+    hasher.update(diff_body);
+    return @truncate(hasher.final());
+}
+
+fn generatedPatchIdentityBody(diff_body: []const u8) []const u8 {
+    if (!std.mem.startsWith(u8, diff_body, "@@ ")) return diff_body;
+    const first_line_end = nextLineEnd(diff_body, 0);
+    return diff_body[@min(first_line_end, diff_body.len)..];
 }
 
 fn parsePatchNode(
@@ -735,11 +766,20 @@ test "generate document from unified diff" {
     const generated = try generateDocumentFromUnifiedDiff(std.testing.allocator, diff);
     defer std.testing.allocator.free(generated);
 
-    try std.testing.expect(std.mem.indexOf(u8, generated, "```diff id=src-main-zig-01") != null);
-    try std.testing.expect(
-        std.mem.indexOf(u8, generated, "```diff id=src-main-zig-02 depends-on=src-main-zig-01") != null,
-    );
-    try std.testing.expect(std.mem.indexOf(u8, generated, "````diff id=readme-md-01") != null);
+    const owned = try std.testing.allocator.dupe(u8, generated);
+    var document = try parseDocument(std.testing.allocator, owned);
+    defer document.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), document.patches.len);
+    try std.testing.expectEqual(@as(usize, 0), document.patches[0].depends_on.len);
+    try std.testing.expectEqual(@as(usize, 1), document.patches[1].depends_on.len);
+    try std.testing.expectEqual(@as(usize, 0), document.patches[2].depends_on.len);
+    try std.testing.expectEqualStrings(document.patches[0].id, document.patches[1].depends_on[0]);
+    try std.testing.expectEqual(@as(usize, 8), document.patches[0].id.len);
+    try std.testing.expectEqual(@as(usize, 8), document.patches[1].id.len);
+    try std.testing.expectEqual(@as(usize, 8), document.patches[2].id.len);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "```diff id=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "````diff id=") != null);
 }
 
 test "detects git revision ranges" {
@@ -747,4 +787,34 @@ test "detects git revision ranges" {
     try std.testing.expect(looksLikeRevisionRange("main...feature"));
     try std.testing.expect(!looksLikeRevisionRange("HEAD~2"));
     try std.testing.expect(!looksLikeRevisionRange("feature-branch"));
+}
+
+test "disambiguates duplicate generated patch ids" {
+    const diff =
+        \\diff --git a/example.txt b/example.txt
+        \\index 1111111..2222222 100644
+        \\--- a/example.txt
+        \\+++ b/example.txt
+        \\@@ -1 +1 @@
+        \\-hello
+        \\+hello world
+        \\@@ -10 +10 @@
+        \\-hello
+        \\+hello world
+        \\
+    ;
+
+    const generated = try generateDocumentFromUnifiedDiff(std.testing.allocator, diff);
+    defer std.testing.allocator.free(generated);
+
+    const owned = try std.testing.allocator.dupe(u8, generated);
+    var document = try parseDocument(std.testing.allocator, owned);
+    defer document.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), document.patches.len);
+    try std.testing.expectEqual(@as(usize, 1), document.patches[1].depends_on.len);
+    try std.testing.expectEqualStrings(document.patches[0].id, document.patches[1].depends_on[0]);
+    try std.testing.expectEqual(@as(usize, 8), document.patches[0].id.len);
+    try std.testing.expect(std.mem.startsWith(u8, document.patches[1].id, document.patches[0].id));
+    try std.testing.expect(std.mem.endsWith(u8, document.patches[1].id, "-2"));
 }
