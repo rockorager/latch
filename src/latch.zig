@@ -162,28 +162,19 @@ pub fn generateDocumentFromUnifiedDiff(allocator: std.mem.Allocator, diff: []con
     var builder: std.ArrayList(u8) = .empty;
     defer builder.deinit(allocator);
 
-    const patch_count = countGeneratedPatches(sections);
     try builder.writer(allocator).print(
         \\# Draft Latch Document
         \\
-        \\This document was generated from the current Git diff. It captures {d}
-        \\executable patch block{s} across {d} changed file{s}.
+        \\Use this file to tell the story of the change. Reorder sections into
+        \\narrative order, rewrite the headings and prose, and keep the diff
+        \\fences executable.
         \\
-        \\This draft is intentionally mechanical. On the human pass, prefer
-        \\narrative order over diff order: start with user-facing commands or
-        \\API entrypoints, then docs and examples, then internal machinery, and
-        \\leave tests or proof points near the end. Keep patch ids stable while
-        \\moving sections. Refine dependencies only when the narrative no longer
-        \\matches the mechanical order.
+        \\Move from user-facing behavior to docs and examples, then internal
+        \\machinery, and leave tests or proof points near the end. Keep patch
+        \\ids stable while moving sections. Refine dependencies only when the
+        \\narrative no longer matches the mechanical order.
         \\
-    ,
-        .{
-            patch_count,
-            if (patch_count == 1) "" else "s",
-            sections.len,
-            if (sections.len == 1) "" else "s",
-        },
-    );
+    , .{});
 
     for (sections) |section| {
         const base_slug = try slugify(allocator, section.path);
@@ -425,14 +416,6 @@ fn parseDiffSection(allocator: std.mem.Allocator, section: []const u8) !DiffSect
         .hunks = hunks,
         .body = section,
     };
-}
-
-fn countGeneratedPatches(sections: []const DiffSection) usize {
-    var count: usize = 0;
-    for (sections) |section| {
-        count += if (section.hunks.len == 0) 1 else section.hunks.len;
-    }
-    return count;
 }
 
 fn parseSectionPath(section: []const u8) ?[]const u8 {
