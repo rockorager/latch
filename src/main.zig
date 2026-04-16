@@ -35,8 +35,8 @@ fn run(allocator: std.mem.Allocator) !void {
         return;
     }
 
-    if (std.mem.eql(u8, args[1], "generate")) {
-        try runGenerate(allocator, args[2..]);
+    if (std.mem.eql(u8, args[1], "draft")) {
+        try runDraft(allocator, args[2..]);
         return;
     }
     if (std.mem.eql(u8, args[1], "apply")) {
@@ -52,7 +52,7 @@ fn run(allocator: std.mem.Allocator) !void {
     return error.InvalidCommand;
 }
 
-fn runGenerate(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn runDraft(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len != 1) return error.MissingOutputPath;
 
     const output_path = args[0];
@@ -108,7 +108,7 @@ fn printUsage() !void {
     var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
     try stderr_writer.interface.writeAll("latch: literate patch proof of concept\n\n");
     try stderr_writer.interface.writeAll("usage:\n");
-    try stderr_writer.interface.writeAll("  latch generate <document.latch.md>\n");
+    try stderr_writer.interface.writeAll("  latch draft <document.latch.md>\n");
     try stderr_writer.interface.writeAll("  latch apply [--dir path] <document.md>\n");
     try stderr_writer.interface.flush();
 }
