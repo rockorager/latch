@@ -13,7 +13,7 @@ That document is meant to be both readable and runnable. After the
 human pass, `latch apply` reads the executable `diff` fences and
 materializes the patch onto a target tree.
 
-`latch skill` prints the checked-in Codex skill for turning code changes
+`latch skill` prints the checked-in Agent skill for turning code changes
 into a Latch narrative.
 
 ## Example
