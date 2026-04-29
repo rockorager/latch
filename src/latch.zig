@@ -17,6 +17,8 @@ pub const DiagnosticKind = enum {
     invalid_patch_part,
     duplicate_patch_part,
     part_dependency_must_be_on_first,
+    invalid_review_metadata,
+    invalid_review_id,
     apply_failed,
     apply_terminated,
 };
@@ -130,6 +132,20 @@ pub const Patch = struct {
     id: []const u8,
     depends_on: []const []const u8,
     diff: []const u8,
+    info: []const u8,
+    start_line: usize,
+    end_line: usize,
+};
+
+pub const ReviewMetadata = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+pub const Review = struct {
+    id: ?[]const u8,
+    metadata: []const ReviewMetadata,
+    text: []const u8,
     info: []const u8,
     start_line: usize,
     end_line: usize,
@@ -306,6 +322,20 @@ pub const Document = struct {
     }
 };
 
+pub const ReviewDocument = struct {
+    allocator: std.mem.Allocator,
+    source: []u8,
+    markdown_document: markdown.Document,
+    reviews: []Review,
+
+    pub fn deinit(self: *ReviewDocument) void {
+        freeReviews(self.allocator, self.reviews);
+        self.markdown_document.deinit();
+        self.allocator.free(self.source);
+        self.* = undefined;
+    }
+};
+
 pub fn generateDocumentFromGitDiff(allocator: std.mem.Allocator) ![]u8 {
     return generateDocumentFromGitDiffWithDiagnostics(allocator, null);
 }
@@ -349,6 +379,20 @@ pub fn loadDocumentFromFileWithDiagnostics(
     return parseDocumentWithDiagnostics(allocator, source, diagnostics);
 }
 
+pub fn loadReviewDocumentFromFile(allocator: std.mem.Allocator, path: []const u8) !ReviewDocument {
+    return loadReviewDocumentFromFileWithDiagnostics(allocator, path, null);
+}
+
+pub fn loadReviewDocumentFromFileWithDiagnostics(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    diagnostics: ?*Diagnostic,
+) !ReviewDocument {
+    const source = try std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024);
+    errdefer allocator.free(source);
+    return parseReviewDocumentWithDiagnostics(allocator, source, diagnostics);
+}
+
 pub fn parseDocument(allocator: std.mem.Allocator, owned_source: []u8) !Document {
     return parseDocumentWithDiagnostics(allocator, owned_source, null);
 }
@@ -387,6 +431,35 @@ pub fn parseDocumentWithDiagnostics(
         .source = owned_source,
         .markdown_document = markdown_document,
         .patches = patches,
+    };
+}
+
+pub fn parseReviewDocument(allocator: std.mem.Allocator, owned_source: []u8) !ReviewDocument {
+    return parseReviewDocumentWithDiagnostics(allocator, owned_source, null);
+}
+
+pub fn parseReviewDocumentWithDiagnostics(
+    allocator: std.mem.Allocator,
+    owned_source: []u8,
+    diagnostics: ?*Diagnostic,
+) !ReviewDocument {
+    var markdown_document = try markdown.parse(allocator, owned_source);
+    errdefer markdown_document.deinit();
+
+    var reviews: std.ArrayList(Review) = .empty;
+    errdefer {
+        freeReviewMetadata(allocator, reviews.items);
+        reviews.deinit(allocator);
+    }
+
+    try collectReviewFences(allocator, owned_source, markdown_document.children, &reviews, diagnostics);
+    const owned_reviews = try reviews.toOwnedSlice(allocator);
+
+    return .{
+        .allocator = allocator,
+        .source = owned_source,
+        .markdown_document = markdown_document,
+        .reviews = owned_reviews,
     };
 }
 
@@ -615,6 +688,37 @@ fn collectPatchFragments(
             try collectPatchFragments(allocator, source, node.children, fragments, diagnostics);
         }
     }
+}
+
+fn collectReviewFences(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    nodes: []const markdown.Node,
+    reviews: *std.ArrayList(Review),
+    diagnostics: ?*Diagnostic,
+) !void {
+    for (nodes) |node| {
+        if (node.kind == .code_block) {
+            if (try parseReviewNode(allocator, source, node, diagnostics)) |review| {
+                errdefer allocator.free(review.metadata);
+                try reviews.append(allocator, review);
+            }
+        }
+        if (node.children.len != 0) {
+            try collectReviewFences(allocator, source, node.children, reviews, diagnostics);
+        }
+    }
+}
+
+fn freeReviewMetadata(allocator: std.mem.Allocator, reviews: []const Review) void {
+    for (reviews) |review| {
+        allocator.free(review.metadata);
+    }
+}
+
+fn freeReviews(allocator: std.mem.Allocator, reviews: []const Review) void {
+    freeReviewMetadata(allocator, reviews);
+    allocator.free(reviews);
 }
 
 fn assemblePatches(
@@ -1390,6 +1494,69 @@ fn parsePatchNode(
     };
 }
 
+fn parseReviewNode(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    node: markdown.Node,
+    diagnostics: ?*Diagnostic,
+) !?Review {
+    var token_iter = std.mem.tokenizeAny(u8, node.info, " \t\r\n");
+    const language = token_iter.next() orelse return null;
+    if (!std.mem.eql(u8, language, "review")) return null;
+
+    const span_start: usize = @intCast(node.span_start);
+    const span_end: usize = @intCast(node.span_end);
+    const start_line = lineNumberForOffset(source, span_start);
+    const end_line = lineNumberForOffset(source, if (span_end == 0) 0 else span_end - 1);
+
+    var id: ?[]const u8 = null;
+    var metadata: std.ArrayList(ReviewMetadata) = .empty;
+    defer metadata.deinit(allocator);
+
+    while (token_iter.next()) |token| {
+        const eq_index = std.mem.indexOfScalar(u8, token, '=') orelse {
+            try emitDiagnostic(
+                "invalid review metadata '{s}' at lines {d}-{d}; expected key=value",
+                .{ token, start_line, end_line },
+                diagnostics,
+                .invalid_review_metadata,
+                .{
+                    .metadata_value = token,
+                    .start_line = start_line,
+                    .end_line = end_line,
+                },
+            );
+            return error.InvalidReviewMetadata;
+        };
+
+        const key = token[0..eq_index];
+        const value = token[eq_index + 1 ..];
+        if (std.mem.eql(u8, key, "id")) {
+            if (value.len == 0) {
+                try emitDiagnostic(
+                    "review fence at lines {d}-{d} has empty id=...",
+                    .{ start_line, end_line },
+                    diagnostics,
+                    .invalid_review_id,
+                    .{ .start_line = start_line, .end_line = end_line },
+                );
+                return error.InvalidReviewId;
+            }
+            id = value;
+        }
+        try metadata.append(allocator, .{ .key = key, .value = value });
+    }
+
+    return .{
+        .id = id,
+        .metadata = try metadata.toOwnedSlice(allocator),
+        .text = node.text,
+        .info = node.info,
+        .start_line = start_line,
+        .end_line = end_line,
+    };
+}
+
 const ReadySelection = struct {
     ready_index: usize,
     patch_index: usize,
@@ -1433,6 +1600,81 @@ fn lineNumberForOffset(source: []const u8, offset: usize) usize {
 fn logError(comptime format: []const u8, args: anytype) void {
     if (builtin.is_test) return;
     std.log.err(format, args);
+}
+
+test "extracts review fences without executable diffs" {
+    const source =
+        \\# Review pass
+        \\
+        \\```review reviewer=tim@timculverhouse.com
+        \\Start the story with behavior.
+        \\```
+        \\
+        \\```review id=core reviewer=tim@timculverhouse.com topic=diagnostics
+        \\Can this mention the unsupported key?
+        \\```
+        \\
+    ;
+
+    const owned = try std.testing.allocator.dupe(u8, source);
+    var document = try parseReviewDocument(std.testing.allocator, owned);
+    defer document.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), document.reviews.len);
+    try std.testing.expectEqual(@as(?[]const u8, null), document.reviews[0].id);
+    try std.testing.expectEqualStrings("Start the story with behavior.", document.reviews[0].text);
+    try std.testing.expectEqual(@as(usize, 3), document.reviews[0].start_line);
+    try std.testing.expectEqual(@as(usize, 5), document.reviews[0].end_line);
+
+    try std.testing.expectEqualStrings("core", document.reviews[1].id.?);
+    try std.testing.expectEqual(@as(usize, 3), document.reviews[1].metadata.len);
+    try std.testing.expectEqualStrings("id", document.reviews[1].metadata[0].key);
+    try std.testing.expectEqualStrings("core", document.reviews[1].metadata[0].value);
+    try std.testing.expectEqualStrings("topic", document.reviews[1].metadata[2].key);
+    try std.testing.expectEqualStrings("diagnostics", document.reviews[1].metadata[2].value);
+}
+
+test "review fences can contain nested code fences" {
+    const source =
+        \\````review id=impl
+        \\Try this shape:
+        \\
+        \\```zig
+        \\try run();
+        \\```
+        \\````
+        \\
+    ;
+
+    const owned = try std.testing.allocator.dupe(u8, source);
+    var document = try parseReviewDocument(std.testing.allocator, owned);
+    defer document.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), document.reviews.len);
+    try std.testing.expectEqualStrings("impl", document.reviews[0].id.?);
+    try std.testing.expect(std.mem.indexOf(u8, document.reviews[0].text, "```zig\ntry run();\n```") != null);
+}
+
+test "rejects malformed review metadata during review extraction" {
+    const source =
+        \\```review id
+        \\Please scope this comment.
+        \\```
+        \\
+    ;
+
+    const owned = try std.testing.allocator.dupe(u8, source);
+    var diagnostics = Diagnostic.init(std.testing.allocator);
+    defer diagnostics.deinit();
+
+    try std.testing.expectError(
+        error.InvalidReviewMetadata,
+        parseReviewDocumentWithDiagnostics(std.testing.allocator, owned, &diagnostics),
+    );
+    std.testing.allocator.free(owned);
+
+    try std.testing.expectEqual(DiagnosticKind.invalid_review_metadata, diagnostics.kind.?);
+    try std.testing.expectEqualStrings("id", diagnostics.metadata_value.?);
 }
 
 test "orders by dependency then id" {

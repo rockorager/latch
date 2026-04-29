@@ -9,7 +9,8 @@ explanation and machine-applicable patches.
 ## Status
 
 This specification is normative for Latch document parsing, patch
-assembly, dependency ordering, and application semantics.
+assembly, dependency ordering, review extraction, and application
+semantics.
 
 `latch draft` is non-normative convenience tooling. It helps authors
 produce Latch documents, but the exact draft layout is not part of the
@@ -23,6 +24,9 @@ format contract.
   rules in this specification.
 - A **patch fragment** is one patch fence before fragment assembly.
 - A **patch** is the assembled unit identified by an `id`.
+- A **review fence** is a fenced code block recognized as reviewer
+  commentary by the rules in this specification.
+- A **review** is one review fence after review metadata has been parsed.
 
 ## Patch Fence Recognition
 
@@ -33,6 +37,21 @@ Info strings that begin with another language name are ignored by the
 Latch parser, even if the fence body looks like a unified diff.
 
 Patch fences may appear anywhere in the Markdown document.
+
+Review fences and other non-patch content do not affect patch parsing,
+assembly, ordering, or application.
+
+## Review Fence Recognition
+
+A fenced code block is a review fence if and only if its info string
+starts with `review`.
+
+Info strings that begin with another language name are ignored by review
+extraction, even if the fence body looks like reviewer commentary.
+
+Review fences may appear anywhere in the Markdown document. They are
+non-executable reviewer commentary. They are ignored by patch assembly
+and `latch apply`.
 
 ## Fence Metadata Grammar
 
@@ -57,7 +76,7 @@ Supported keys:
 - `part`
   Optional. Contains a base-10 positive integer.
 
-Unsupported metadata keys are invalid.
+Unsupported metadata keys are invalid for patch fences.
 
 Metadata tokens that are not in `key=value` form are invalid.
 
@@ -67,6 +86,45 @@ A `part` value is invalid if it is not a positive integer.
 
 For `depends-on`, commas separate dependency ids. Empty dependency
 entries produced by trimming whitespace are ignored.
+
+## Review Metadata Grammar
+
+After the leading `review` token, the remainder of the info string is
+parsed as space-separated `key=value` tokens.
+
+Example:
+
+````md
+```review reviewer=tim@timculverhouse.com id=core
+Can this diagnostic include the unsupported metadata key?
+```
+````
+
+All metadata keys are allowed on review fences. The `id` key has special
+meaning: it names the patch id that the review targets. If `id` is
+omitted, the review targets the document as a whole.
+
+An `id` value is invalid for review extraction if it is present but
+empty. If multiple `id` tokens appear, the last `id` token determines
+the review target. Consumers should preserve all review metadata tokens
+in source order.
+
+Metadata tokens that are not in `key=value` form are invalid for review
+extraction, but they do not affect patch parsing or application because
+review fences are non-executable.
+
+Review fence bodies are reviewer-authored text. If a review body needs
+to contain a fenced code block, use a longer outer fence:
+
+`````md
+````review id=core
+Consider this shape:
+
+```zig
+try run();
+```
+````
+`````
 
 ## Patch Fragment Assembly
 
@@ -94,6 +152,20 @@ concatenating their diff bodies.
 
 If a split patch declares `depends-on`, it must do so only on `part=1`.
 Dependencies on later parts are invalid.
+
+## Review Extraction
+
+Review extraction collects every review fence in Markdown order. Each
+review contains:
+
+- an optional target `id`
+- all metadata tokens in source order
+- a body taken from the fence contents
+- the source line range of the fence, when available
+
+Review extraction does not require the document to contain patch fences.
+Review extraction does not validate that a review target `id` refers to
+an existing patch id.
 
 ## Patch Ordering
 
@@ -138,6 +210,11 @@ A Latch document is invalid if any of the following hold:
 - a dependency refers to an unknown patch id
 - a patch depends on itself
 - dependencies contain a cycle
+
+For review extraction, a review fence is invalid if any metadata token
+after `review` is not in `key=value` form or if it contains an empty
+`id=` value. Review-fence errors do not make patch parsing or
+application invalid.
 
 ## Minimal Example
 
