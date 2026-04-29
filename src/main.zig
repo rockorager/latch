@@ -49,6 +49,10 @@ fn run(allocator: std.mem.Allocator, diagnostics: *latch.Diagnostic) !void {
         try runApply(allocator, args[2..], diagnostics);
         return;
     }
+    if (std.mem.eql(u8, args[1], "review")) {
+        try runReview(allocator, args[2..], diagnostics);
+        return;
+    }
     if (std.mem.eql(u8, args[1], "skill")) {
         try runSkill(args[2..]);
         return;
@@ -165,6 +169,39 @@ fn runApply(allocator: std.mem.Allocator, args: []const []const u8, diagnostics:
     try stdout_writer.interface.flush();
 }
 
+fn runReview(allocator: std.mem.Allocator, args: []const []const u8, diagnostics: *latch.Diagnostic) !void {
+    if (args.len == 1 and isHelpFlag(args[0])) {
+        try printReviewUsage();
+        return;
+    }
+
+    var document_path: ?[]const u8 = null;
+    var output_json = false;
+
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--json")) {
+            output_json = true;
+            continue;
+        }
+        if (document_path != null) return error.UnexpectedArgument;
+        document_path = arg;
+    }
+
+    var document = try loadReviewDocument(allocator, document_path, diagnostics);
+    defer document.deinit();
+
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    if (output_json) {
+        try writeReviewsJson(&stdout_writer.interface, document.reviews);
+    } else {
+        try writeReviewsMarkdown(&stdout_writer.interface, document.reviews);
+    }
+    try stdout_writer.interface.flush();
+}
+
 fn loadApplyDocument(
     allocator: std.mem.Allocator,
     document_path: ?[]const u8,
@@ -196,6 +233,37 @@ fn loadDocumentFromStdin(
     return latch.parseDocumentWithDiagnostics(allocator, source, diagnostics);
 }
 
+fn loadReviewDocument(
+    allocator: std.mem.Allocator,
+    document_path: ?[]const u8,
+    diagnostics: *latch.Diagnostic,
+) !latch.ReviewDocument {
+    if (document_path) |path| {
+        if (std.mem.eql(u8, path, "-")) {
+            return loadReviewDocumentFromStdin(allocator, diagnostics, false);
+        }
+        return latch.loadReviewDocumentFromFileWithDiagnostics(allocator, path, diagnostics);
+    }
+
+    const stdin_file = std.fs.File.stdin();
+    if (stdin_file.isTty()) return error.MissingDocumentPath;
+    return loadReviewDocumentFromStdin(allocator, diagnostics, true);
+}
+
+fn loadReviewDocumentFromStdin(
+    allocator: std.mem.Allocator,
+    diagnostics: *latch.Diagnostic,
+    empty_is_missing_path: bool,
+) !latch.ReviewDocument {
+    const stdin_file = std.fs.File.stdin();
+    const source = try stdin_file.readToEndAlloc(allocator, max_input_bytes);
+    errdefer allocator.free(source);
+
+    if (empty_is_missing_path and source.len == 0) return error.MissingDocumentPath;
+
+    return latch.parseReviewDocumentWithDiagnostics(allocator, source, diagnostics);
+}
+
 fn runSkill(args: []const []const u8) !void {
     if (args.len == 1 and isHelpFlag(args[0])) {
         try printSkillUsage();
@@ -213,6 +281,83 @@ fn writeSkill(writer: anytype) !void {
     try writer.writeAll(skill_markdown);
 }
 
+fn writeReviewsMarkdown(writer: anytype, reviews: []const latch.Review) !void {
+    if (reviews.len == 0) {
+        try writer.writeAll("no reviews found\n");
+        return;
+    }
+
+    try writer.writeAll("# Reviews\n\n");
+    for (reviews, 0..) |review, index| {
+        if (review.id) |id| {
+            try writer.print(
+                "## {d}. `{s}` (lines {d}-{d})\n\n",
+                .{ index + 1, id, review.start_line, review.end_line },
+            );
+        } else {
+            try writer.print(
+                "## {d}. Global review (lines {d}-{d})\n\n",
+                .{ index + 1, review.start_line, review.end_line },
+            );
+        }
+
+        if (review.metadata.len != 0) {
+            try writer.writeAll("metadata:\n");
+            for (review.metadata) |entry| {
+                try writer.print("- {s}: {s}\n", .{ entry.key, entry.value });
+            }
+            try writer.writeAll("\n");
+        }
+
+        if (review.text.len != 0) {
+            try writer.writeAll(review.text);
+            if (!std.mem.endsWith(u8, review.text, "\n")) {
+                try writer.writeAll("\n");
+            }
+        }
+        try writer.writeAll("\n");
+    }
+}
+
+fn writeReviewsJson(writer: *std.Io.Writer, reviews: []const latch.Review) !void {
+    var jw: std.json.Stringify = .{
+        .writer = writer,
+        .options = .{ .whitespace = .indent_2 },
+    };
+
+    try jw.beginObject();
+    try jw.objectField("reviews");
+    try jw.beginArray();
+    for (reviews) |review| {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(review.id);
+        try jw.objectField("start_line");
+        try jw.write(review.start_line);
+        try jw.objectField("end_line");
+        try jw.write(review.end_line);
+        try jw.objectField("info");
+        try jw.write(review.info);
+        try jw.objectField("metadata");
+        try jw.beginArray();
+        for (review.metadata) |entry| {
+            try jw.beginObject();
+            try jw.objectField("key");
+            try jw.write(entry.key);
+            try jw.objectField("value");
+            try jw.write(entry.value);
+            try jw.endObject();
+        }
+        try jw.endArray();
+        try jw.objectField("body");
+        try jw.write(review.text);
+        try jw.endObject();
+    }
+    try jw.endArray();
+    try jw.endObject();
+    try writer.writeAll("\n");
+}
+
 fn printUsage() !void {
     var stderr_buffer: [1024]u8 = undefined;
     var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
@@ -226,6 +371,7 @@ fn printUsage() !void {
         \\  draft    Generate a Latch draft from stdin, a Git spec, or the
         \\           current worktree diff
         \\  apply    Apply executable diff fences from a Latch document
+        \\  review   Extract review fences from a Latch document
         \\  skill    Print the checked-in Latch Codex skill
         \\
         \\EXAMPLES
@@ -233,11 +379,13 @@ fn printUsage() !void {
         \\  latch draft HEAD~1 -o change.latch.md
         \\  git diff | latch draft -o change.latch.md
         \\  latch apply change.latch.md
+        \\  latch review change.latch.md
         \\  latch skill
         \\
         \\LEARN MORE
         \\  latch draft --help
         \\  latch apply --help
+        \\  latch review --help
         \\  latch skill --help
         \\
     );
@@ -293,6 +441,34 @@ fn printApplyUsage() !void {
         \\  latch apply change.latch.md
         \\  cat change.latch.md | latch apply
         \\  latch apply --dir /tmp/repo -
+        \\
+    );
+    try stderr_writer.interface.flush();
+}
+
+fn printReviewUsage() !void {
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+    try stderr_writer.interface.writeAll(
+        \\Extract review fences from a Latch document
+        \\
+        \\USAGE
+        \\  latch review [--json] [document.md|-]
+        \\
+        \\OPTIONS
+        \\  --json                Write machine-readable JSON
+        \\  -h, --help            Show help for review
+        \\
+        \\DETAILS
+        \\  Reads a Latch document from stdin when piped without a path.
+        \\  Use '-' as the document path to read stdin explicitly.
+        \\  Review fence info strings start with 'review'; id=patch-id
+        \\  scopes a comment to a patch.
+        \\
+        \\EXAMPLES
+        \\  latch review change.latch.md
+        \\  latch review --json change.latch.md
+        \\  cat change.latch.md | latch review
         \\
     );
     try stderr_writer.interface.flush();
@@ -461,6 +637,14 @@ fn writeDiagnostic(writer: anytype, diagnostics: *const latch.Diagnostic) !void 
             "error: patch '{s}' part={d} cannot declare depends-on; use part=1\n",
             .{ diagnostics.patch_id.?, diagnostics.part.? },
         ),
+        .invalid_review_metadata => try writer.print(
+            "error: invalid review metadata '{s}' at lines {d}-{d}; expected key=value\n",
+            .{ diagnostics.metadata_value.?, diagnostics.start_line.?, diagnostics.end_line.? },
+        ),
+        .invalid_review_id => try writer.print(
+            "error: review fence at lines {d}-{d} has empty id=...\n",
+            .{ diagnostics.start_line.?, diagnostics.end_line.? },
+        ),
         .apply_failed => {
             try writer.print(
                 "error: apply patch '{s}' failed with exit code {d}\n",
@@ -493,4 +677,65 @@ test "skill command prints embedded skill markdown" {
     defer std.testing.allocator.free(output);
 
     try std.testing.expectEqualStrings(skill_markdown, output);
+}
+
+test "review markdown output lists review metadata and body" {
+    const metadata = [_]latch.ReviewMetadata{
+        .{ .key = "id", .value = "core" },
+        .{ .key = "reviewer", .value = "tim@timculverhouse.com" },
+    };
+    const reviews = [_]latch.Review{.{
+        .id = "core",
+        .metadata = &metadata,
+        .text = "Please mention the unsupported key.",
+        .info = "review id=core reviewer=tim@timculverhouse.com",
+        .start_line = 3,
+        .end_line = 5,
+    }};
+
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+
+    try writeReviewsMarkdown(&writer.writer, &reviews);
+
+    const output = try writer.toOwnedSlice();
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqualStrings(
+        \\# Reviews
+        \\
+        \\## 1. `core` (lines 3-5)
+        \\
+        \\metadata:
+        \\- id: core
+        \\- reviewer: tim@timculverhouse.com
+        \\
+        \\Please mention the unsupported key.
+        \\
+        \\
+    , output);
+}
+
+test "review json output includes reviews array" {
+    const metadata = [_]latch.ReviewMetadata{.{ .key = "reviewer", .value = "tim" }};
+    const reviews = [_]latch.Review{.{
+        .id = null,
+        .metadata = &metadata,
+        .text = "Start with behavior.",
+        .info = "review reviewer=tim",
+        .start_line = 1,
+        .end_line = 3,
+    }};
+
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+
+    try writeReviewsJson(&writer.writer, &reviews);
+
+    const output = try writer.toOwnedSlice();
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"reviews\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"id\": null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Start with behavior.") != null);
 }

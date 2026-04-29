@@ -44,13 +44,16 @@ without breaking apply semantics.
    Preserve patch ids while moving sections. Only change dependencies
    when the new narrative order no longer matches the generated apply
    order.
-6. Add context between fences.
+6. Treat `review` fences as temporary reviewer instructions.
+   Resolve them by updating code, diffs, prose, ordering, or dependencies,
+   then remove review fences that have been handled.
+7. Add context between fences.
    Explain intent, contracts, and why the change is structured this way.
    If the diff is missing important context, add non-diff code fences.
-7. Split patches when the story needs finer structure.
+8. Split patches when the story needs finer structure.
    Reuse the same `id` across multiple fences and add contiguous
    `part=1`, `part=2`, and so on.
-8. Apply the document when verification matters.
+9. Apply the document when verification matters.
    Use `latch apply` to materialize the document onto a target tree.
 
 ## Authoring Rules
@@ -63,6 +66,9 @@ without breaking apply semantics.
 - Keep `diff` fences as `diff` fences.
 - Keep `id=...` stable when moving a patch.
 - `depends-on=...` controls apply order, not Markdown position.
+- Review fences use `review [id=patch-id]` and are not executable.
+- Remove review fences after addressing them unless the user asks to keep
+  unresolved comments.
 - To split one logical patch across multiple fences, reuse the same `id`
   and add contiguous `part=1`, `part=2`, and so on.
 - Split patches wherever the narrative benefits from it. The boundary is
@@ -92,6 +98,7 @@ diff --git a/path b/path
 - `latch draft`: generate a first-pass Latch document from stdin, a Git
   spec, or the current worktree diff.
 - `latch apply`: apply patches from a Latch document.
+- `latch review`: extract reviewer comments from a Latch document.
 
 ## Examples
 
@@ -100,5 +107,6 @@ mkdir -p .latch
 latch draft > .latch/change.latch.md
 latch draft HEAD~1 > .latch/change.latch.md
 git diff | latch draft > .latch/change.latch.md
+latch review .latch/change.latch.md
 latch apply .latch/change.latch.md
 ```

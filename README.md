@@ -102,6 +102,14 @@ cat change.latch.md | latch apply
 latch apply --dir /tmp/repo -
 ```
 
+Extract reviewer comments from a Latch document path or stdin:
+
+```sh
+latch review change.latch.md
+cat change.latch.md | latch review
+latch review --json change.latch.md
+```
+
 Print the repo skill:
 
 ```sh
@@ -115,7 +123,10 @@ latch skill
 3. Rewrite the generated draft into a real patch narrative.
 4. Keep executable `diff` fences intact while reordering sections and
    improving the prose.
-5. Run `latch apply` to materialize the document onto a target tree.
+5. Reviewers may add non-executable `review` fences with optional
+   `id=patch-id` metadata.
+6. Run `latch review` to extract those comments for the next authoring
+   pass, or `latch apply` to materialize the document onto a target tree.
 
 Generated drafts are intentionally mechanical. They preserve
 fine-grained Git hunks, assign deterministic patch ids, and include
@@ -147,7 +158,9 @@ Short version:
 
 - patch fences are fenced code blocks whose info string starts with
   `diff`
-- supported metadata keys are `id`, `depends-on`, and `part`
+- supported patch metadata keys are `id`, `depends-on`, and `part`
+- review fences are fenced code blocks whose info string starts with
+  `review`; optional `id=patch-id` scopes a comment to a patch
 - `depends-on` controls apply order, not Markdown position
 - split patches reuse the same `id` with contiguous `part=1..N`
 
