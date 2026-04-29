@@ -4,6 +4,7 @@ const build_options = @import("build_options");
 const latch = @import("latch.zig");
 
 const skill_markdown = build_options.skill_markdown;
+const max_input_bytes = 16 * 1024 * 1024;
 
 pub fn main() void {
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
@@ -86,7 +87,7 @@ fn runDraft(allocator: std.mem.Allocator, args: []const []const u8, diagnostics:
     const stdin_file = std.fs.File.stdin();
     const stdin_diff = stdin_diff: {
         if (stdin_file.isTty()) break :stdin_diff null;
-        const data = try stdin_file.readToEndAlloc(allocator, 16 * 1024 * 1024);
+        const data = try stdin_file.readToEndAlloc(allocator, max_input_bytes);
         if (data.len == 0) {
             allocator.free(data);
             break :stdin_diff null;
@@ -150,9 +151,7 @@ fn runApply(allocator: std.mem.Allocator, args: []const []const u8, diagnostics:
         document_path = arg;
     }
 
-    const path = document_path orelse return error.MissingDocumentPath;
-
-    var document = try latch.loadDocumentFromFileWithDiagnostics(allocator, path, diagnostics);
+    var document = try loadApplyDocument(allocator, document_path, diagnostics);
     defer document.deinit();
 
     const ordered = try document.orderedPatchIndicesWithDiagnostics(allocator, diagnostics);
@@ -164,6 +163,37 @@ fn runApply(allocator: std.mem.Allocator, args: []const []const u8, diagnostics:
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     try stdout_writer.interface.print("applied {d} patches to {s}\n", .{ ordered.len, target_dir });
     try stdout_writer.interface.flush();
+}
+
+fn loadApplyDocument(
+    allocator: std.mem.Allocator,
+    document_path: ?[]const u8,
+    diagnostics: *latch.Diagnostic,
+) !latch.Document {
+    if (document_path) |path| {
+        if (std.mem.eql(u8, path, "-")) {
+            return loadDocumentFromStdin(allocator, diagnostics, false);
+        }
+        return latch.loadDocumentFromFileWithDiagnostics(allocator, path, diagnostics);
+    }
+
+    const stdin_file = std.fs.File.stdin();
+    if (stdin_file.isTty()) return error.MissingDocumentPath;
+    return loadDocumentFromStdin(allocator, diagnostics, true);
+}
+
+fn loadDocumentFromStdin(
+    allocator: std.mem.Allocator,
+    diagnostics: *latch.Diagnostic,
+    empty_is_missing_path: bool,
+) !latch.Document {
+    const stdin_file = std.fs.File.stdin();
+    const source = try stdin_file.readToEndAlloc(allocator, max_input_bytes);
+    errdefer allocator.free(source);
+
+    if (empty_is_missing_path and source.len == 0) return error.MissingDocumentPath;
+
+    return latch.parseDocumentWithDiagnostics(allocator, source, diagnostics);
 }
 
 fn runSkill(args: []const []const u8) !void {
@@ -249,15 +279,20 @@ fn printApplyUsage() !void {
         \\Apply executable diff fences from a Latch document
         \\
         \\USAGE
-        \\  latch apply [--dir path] <document.md>
+        \\  latch apply [--dir path] [document.md|-]
         \\
         \\OPTIONS
         \\  --dir <path>          Apply patches relative to a target directory
         \\  -h, --help            Show help for apply
         \\
+        \\DETAILS
+        \\  Reads a Latch document from stdin when piped without a path.
+        \\  Use '-' as the document path to read stdin explicitly.
+        \\
         \\EXAMPLES
         \\  latch apply change.latch.md
-        \\  latch apply --dir /tmp/repo change.latch.md
+        \\  cat change.latch.md | latch apply
+        \\  latch apply --dir /tmp/repo -
         \\
     );
     try stderr_writer.interface.flush();

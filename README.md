@@ -94,10 +94,12 @@ Draft from stdin:
 git diff | latch draft -o change.latch.md
 ```
 
-Apply a Latch document:
+Apply a Latch document from a path or stdin:
 
 ```sh
 latch apply change.latch.md
+cat change.latch.md | latch apply
+latch apply --dir /tmp/repo -
 ```
 
 Print the repo skill:
