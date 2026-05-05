@@ -204,7 +204,8 @@ A compact Latch commit stores the code change in the normal Git commit
 tree and a compact Latch recipe in the Git commit message body. The
 first H1 of the source Latch document becomes the Git commit subject;
 the stored recipe omits that H1. `latch show` restores the subject as an
-H1 before expanding the recipe.
+H1 before expanding the recipe. When no commit is specified, `latch show`
+uses `HEAD`.
 
 A compact recipe uses fenced code blocks whose info string starts with
 `latch-ref`. A `latch-ref` fence supports the normal patch metadata
@@ -231,7 +232,7 @@ blocks. A block is either a whole file diff with no hunks, or one file
 prelude plus one hunk. This mirrors the block structure emitted by
 `latch draft`.
 
-`latch show <commit>` reconstructs a full Latch document by replacing
+`latch show [commit]` reconstructs a full Latch document by replacing
 each `latch-ref` fence with a `diff` fence carrying the same `id`,
 `depends-on`, and `part` metadata. The diff fence body is the
 concatenation of the referenced canonical block line ranges.

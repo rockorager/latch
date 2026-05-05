@@ -198,9 +198,10 @@ fn runShow(allocator: std.mem.Allocator, args: []const []const u8, diagnostics: 
         try printShowUsage();
         return;
     }
-    if (args.len != 1) return error.UnexpectedArgument;
+    if (args.len > 1) return error.UnexpectedArgument;
 
-    const document = try latch.showCommitWithDiagnostics(allocator, args[0], diagnostics);
+    const commit = if (args.len == 0) "HEAD" else args[0];
+    const document = try latch.showCommitWithDiagnostics(allocator, commit, diagnostics);
     defer allocator.free(document);
 
     var stdout_buffer: [4096]u8 = undefined;
@@ -422,7 +423,7 @@ fn printUsage() !void {
         \\  git diff | latch draft -o change.latch.md
         \\  latch apply change.latch.md
         \\  latch commit change.latch.md
-        \\  latch show HEAD
+        \\  latch show
         \\  latch review change.latch.md
         \\  latch skill
         \\
@@ -524,7 +525,7 @@ fn printShowUsage() !void {
         \\Reconstruct a Latch document from a compact Latch commit
         \\
         \\USAGE
-        \\  latch show <commit>
+        \\  latch show [commit]
         \\
         \\OPTIONS
         \\  -h, --help            Show help for show
@@ -532,10 +533,11 @@ fn printShowUsage() !void {
         \\DETAILS
         \\  Reads latch-ref fences from the commit body, computes the
         \\  canonical parent-to-commit diff, and prints the expanded Latch
-        \\  document with executable diff fences.
+        \\  document with executable diff fences. Defaults to HEAD.
         \\
         \\EXAMPLES
-        \\  latch show HEAD
+        \\  latch show
+        \\  latch show HEAD~1
         \\
     );
     try stderr_writer.interface.flush();
