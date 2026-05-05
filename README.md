@@ -116,6 +116,12 @@ Print the repo skill:
 latch skill
 ```
 
+## Editor integrations
+
+A small Neovim plugin lives in `contrib/nvim/latch.nvim`. It applies to
+`*.latch.md` files, completes patch ids, inserts `review` fences, and can
+run `latch review` from the current buffer.
+
 ## Workflow
 
 1. Make code changes normally.
