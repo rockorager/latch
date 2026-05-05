@@ -6,7 +6,8 @@ description: Use when turning code changes into a literate patch narrative, or w
 # Latch
 
 Use this skill to turn code changes into a readable Markdown patch narrative
-that still applies with `latch apply`.
+that still applies with `latch apply` and can be carried through Git with
+`latch commit` / `latch show`.
 
 ## When To Use It
 
@@ -102,10 +103,55 @@ start from a blank document; always begin with the mechanical draft from
      dependencies, then run `latch apply` again.
    - If you do not validate, say so explicitly in the final response.
 
-9. Deliver the result.
+9. Commit the document only when the user asks.
+   - Use:
+     ```sh
+     latch commit .latch/change.latch.md
+     ```
+   - `latch commit` creates a Git commit from the Latch document and stores a
+     compact recipe in the commit body instead of full diff bodies.
+   - The document's first H1 becomes the Git commit subject.
+   - The tracked worktree must be clean before running `latch commit`; if it is
+     not clean, either ask the user how to proceed or preserve the diff before
+     cleaning/resetting.
+   - After committing, verify reconstructability when practical:
+     ```sh
+     latch show > /tmp/change.latch.md
+     ```
+
+10. Deliver the result.
    - Provide the path to the finished `.latch/*.latch.md` file, or paste the
      finished Latch document if the user asked for inline output.
    - Mention whether `latch apply` was run successfully.
+   - If you ran `latch commit`, report the commit hash and whether `latch show`
+     reconstruction was checked.
+
+## Commit and Show Latch Documents
+
+Use this workflow when the user asks to commit a Latch document or reconstruct
+one from a compact Latch commit.
+
+1. Commit from a finished Latch document with:
+   ```sh
+   latch commit .latch/change.latch.md
+   ```
+   Do not use `git commit` for this workflow; `latch commit` writes the code
+   tree and compact Latch recipe together.
+
+2. Reconstruct from the latest compact Latch commit with:
+   ```sh
+   latch show > .latch/change.latch.md
+   ```
+   `latch show` defaults to `HEAD`, like `git show`. Use `latch show <commit>`
+   for another commit.
+
+3. Prefer `latch show` over `latch draft <commit>` when the commit was created
+   by `latch commit`. `latch show` reconstructs the authored narrative;
+   `latch draft` only creates a new mechanical draft from the commit diff.
+
+4. A compact recipe contains `latch-ref` fences with `ranges=...`. Do not edit
+   those by hand unless you are intentionally working on compact carriage. Use
+   `latch show` to materialize normal executable `diff` fences for authoring.
 
 ## Revise a Reviewed Latch Document
 
@@ -181,6 +227,10 @@ Describe the requested change or concern here.
 - `latch draft`: generate a first-pass Latch document from stdin, a Git spec,
   or the current worktree diff.
 - `latch apply`: apply patches from a Latch document.
+- `latch commit`: create a Git commit from a Latch document, storing a compact
+  recipe in the commit message body.
+- `latch show`: reconstruct a full Latch document from a compact Latch commit;
+  defaults to `HEAD`.
 - `latch review`: extract reviewer comments from a Latch document.
 
 ## Hard Rules
@@ -191,6 +241,9 @@ Describe the requested change or concern here.
   of starting from scratch.
 - When revising a reviewed Latch document, inspect and resolve `review` fences
   before finalizing.
+- When asked to commit a Latch document, use `latch commit`, not `git commit`.
+- When asked to reconstruct a Latch document from a compact Latch commit, use
+  `latch show`, not `latch draft`.
 - Keep patch ids stable.
 - Keep `diff` fences as patch fences.
 - Keep non-patch examples out of `diff` fences.
@@ -209,6 +262,8 @@ latch draft > .latch/change.latch.md
 latch draft HEAD~1 > .latch/change.latch.md
 git diff | latch draft > .latch/change.latch.md
 latch apply .latch/change.latch.md
+latch commit .latch/change.latch.md
+latch show > .latch/change.latch.md
 ```
 
 Revise a reviewed Latch document:
