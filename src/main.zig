@@ -49,6 +49,14 @@ fn run(allocator: std.mem.Allocator, diagnostics: *latch.Diagnostic) !void {
         try runApply(allocator, args[2..], diagnostics);
         return;
     }
+    if (std.mem.eql(u8, args[1], "commit")) {
+        try runCommit(allocator, args[2..], diagnostics);
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "show")) {
+        try runShow(allocator, args[2..], diagnostics);
+        return;
+    }
     if (std.mem.eql(u8, args[1], "review")) {
         try runReview(allocator, args[2..], diagnostics);
         return;
@@ -166,6 +174,38 @@ fn runApply(allocator: std.mem.Allocator, args: []const []const u8, diagnostics:
     var stdout_buffer: [1024]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     try stdout_writer.interface.print("applied {d} patches to {s}\n", .{ ordered.len, target_dir });
+    try stdout_writer.interface.flush();
+}
+
+fn runCommit(allocator: std.mem.Allocator, args: []const []const u8, diagnostics: *latch.Diagnostic) !void {
+    if (args.len == 1 and isHelpFlag(args[0])) {
+        try printCommitUsage();
+        return;
+    }
+    if (args.len != 1) return error.MissingDocumentPath;
+
+    const commit_id = try latch.commitDocumentFromFileWithDiagnostics(allocator, args[0], diagnostics);
+    defer allocator.free(commit_id);
+
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    try stdout_writer.interface.print("committed {s}\n", .{std.mem.trimEnd(u8, commit_id, "\r\n")});
+    try stdout_writer.interface.flush();
+}
+
+fn runShow(allocator: std.mem.Allocator, args: []const []const u8, diagnostics: *latch.Diagnostic) !void {
+    if (args.len == 1 and isHelpFlag(args[0])) {
+        try printShowUsage();
+        return;
+    }
+    if (args.len != 1) return error.UnexpectedArgument;
+
+    const document = try latch.showCommitWithDiagnostics(allocator, args[0], diagnostics);
+    defer allocator.free(document);
+
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    try stdout_writer.interface.writeAll(document);
     try stdout_writer.interface.flush();
 }
 
@@ -371,6 +411,8 @@ fn printUsage() !void {
         \\  draft    Generate a Latch draft from stdin, a Git spec, or the
         \\           current worktree diff
         \\  apply    Apply executable diff fences from a Latch document
+        \\  commit   Create a Git commit from a Latch document
+        \\  show     Reconstruct a Latch document from a compact Latch commit
         \\  review   Extract review fences from a Latch document
         \\  skill    Print the checked-in Latch Codex skill
         \\
@@ -379,12 +421,16 @@ fn printUsage() !void {
         \\  latch draft HEAD~1 -o change.latch.md
         \\  git diff | latch draft -o change.latch.md
         \\  latch apply change.latch.md
+        \\  latch commit change.latch.md
+        \\  latch show HEAD
         \\  latch review change.latch.md
         \\  latch skill
         \\
         \\LEARN MORE
         \\  latch draft --help
         \\  latch apply --help
+        \\  latch commit --help
+        \\  latch show --help
         \\  latch review --help
         \\  latch skill --help
         \\
@@ -441,6 +487,55 @@ fn printApplyUsage() !void {
         \\  latch apply change.latch.md
         \\  cat change.latch.md | latch apply
         \\  latch apply --dir /tmp/repo -
+        \\
+    );
+    try stderr_writer.interface.flush();
+}
+
+fn printCommitUsage() !void {
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+    try stderr_writer.interface.writeAll(
+        \\Create a Git commit from a Latch document
+        \\
+        \\USAGE
+        \\  latch commit <document.latch.md>
+        \\
+        \\OPTIONS
+        \\  -h, --help            Show help for commit
+        \\
+        \\DETAILS
+        \\  The document must start with an H1. The H1 text becomes the Git
+        \\  commit subject. The commit body stores a compact Latch recipe
+        \\  with latch-ref fences; latch show expands those refs back into
+        \\  executable diff fences from the commit diff.
+        \\
+        \\EXAMPLES
+        \\  latch commit change.latch.md
+        \\
+    );
+    try stderr_writer.interface.flush();
+}
+
+fn printShowUsage() !void {
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+    try stderr_writer.interface.writeAll(
+        \\Reconstruct a Latch document from a compact Latch commit
+        \\
+        \\USAGE
+        \\  latch show <commit>
+        \\
+        \\OPTIONS
+        \\  -h, --help            Show help for show
+        \\
+        \\DETAILS
+        \\  Reads latch-ref fences from the commit body, computes the
+        \\  canonical parent-to-commit diff, and prints the expanded Latch
+        \\  document with executable diff fences.
+        \\
+        \\EXAMPLES
+        \\  latch show HEAD
         \\
     );
     try stderr_writer.interface.flush();

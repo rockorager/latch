@@ -187,6 +187,27 @@ const DiffLineStats = struct {
     kind: FileChangeKind = .modified,
 };
 
+const CanonicalDiffBlock = struct {
+    text: []const u8,
+};
+
+const DiffLineRef = struct {
+    block_index: usize,
+    line_index: usize,
+    text: []const u8,
+};
+
+const LineRange = struct {
+    block_index: usize,
+    start_line: usize,
+    end_line: usize,
+};
+
+const InitialHeading = struct {
+    subject: []const u8,
+    body_start: usize,
+};
+
 const PathEntry = struct {
     section: *const DiffSection,
     segments: []const []const u8,
@@ -363,6 +384,66 @@ pub fn generateDocumentFromGitSpecWithDiagnostics(
     defer allocator.free(diff);
 
     return generateDocumentFromUnifiedDiffWithDiagnostics(allocator, diff, diagnostics);
+}
+
+pub fn commitDocumentFromFileWithDiagnostics(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    diagnostics: ?*Diagnostic,
+) ![]u8 {
+    var document = try loadDocumentFromFileWithDiagnostics(allocator, path, diagnostics);
+    defer document.deinit();
+
+    return commitDocumentWithDiagnostics(allocator, &document, diagnostics);
+}
+
+pub fn showCommitWithDiagnostics(
+    allocator: std.mem.Allocator,
+    commit: []const u8,
+    diagnostics: ?*Diagnostic,
+) ![]u8 {
+    const subject = try runGitCapture(
+        allocator,
+        &.{ "git", "log", "-1", "--format=%s", commit },
+        null,
+        diagnostics,
+    );
+    defer allocator.free(subject);
+
+    const body = try runGitCapture(
+        allocator,
+        &.{ "git", "log", "-1", "--format=%b", commit },
+        null,
+        diagnostics,
+    );
+    defer allocator.free(body);
+
+    const parent_spec = try std.fmt.allocPrint(allocator, "{s}^", .{commit});
+    defer allocator.free(parent_spec);
+    const parent = try runGitCapture(
+        allocator,
+        &.{ "git", "rev-parse", parent_spec },
+        null,
+        diagnostics,
+    );
+    defer allocator.free(parent);
+
+    const trimmed_parent = std.mem.trimEnd(u8, parent, "\r\n");
+    const diff = try collectCanonicalCommitDiff(allocator, trimmed_parent, commit, diagnostics);
+    defer allocator.free(diff);
+
+    const blocks = try canonicalDiffBlocksFromDiff(allocator, diff, diagnostics);
+    defer freeCanonicalDiffBlocks(allocator, blocks);
+
+    var compact_source: std.ArrayList(u8) = .empty;
+    defer compact_source.deinit(allocator);
+    const trimmed_subject = std.mem.trimEnd(u8, subject, "\r\n");
+    try compact_source.writer(allocator).print("# {s}\n\n", .{trimmed_subject});
+    try compact_source.appendSlice(allocator, body);
+    const owned_source = try compact_source.toOwnedSlice(allocator);
+    defer allocator.free(owned_source);
+
+    return expandCompactRecipeWithBlocks(allocator, owned_source, blocks, diagnostics);
 }
 
 pub fn loadDocumentFromFile(allocator: std.mem.Allocator, path: []const u8) !Document {
@@ -671,6 +752,114 @@ pub fn applyPatchesWithDiagnostics(
     }
 }
 
+fn commitDocumentWithDiagnostics(
+    allocator: std.mem.Allocator,
+    document: *const Document,
+    diagnostics: ?*Diagnostic,
+) ![]u8 {
+    const heading = parseInitialHeading(document.source) orelse return error.MissingLatchHeading;
+
+    const ordered = try document.orderedPatchIndicesWithDiagnostics(allocator, diagnostics);
+    defer allocator.free(ordered);
+
+    try ensureCleanWorktree(allocator);
+
+    const temp_dir_raw = try runGitCapture(
+        allocator,
+        &.{ "git", "rev-parse", "--git-path", "latch-tmp" },
+        null,
+        diagnostics,
+    );
+    defer allocator.free(temp_dir_raw);
+    const temp_dir = std.mem.trimEnd(u8, temp_dir_raw, "\r\n");
+    try std.fs.cwd().makePath(temp_dir);
+
+    const nonce = std.crypto.random.int(u64);
+    const index_path = try std.fmt.allocPrint(allocator, "{s}/index-{x}", .{ temp_dir, nonce });
+    defer allocator.free(index_path);
+    defer std.fs.cwd().deleteFile(index_path) catch {};
+
+    var env_map = try std.process.getEnvMap(allocator);
+    defer env_map.deinit();
+    try env_map.put("GIT_INDEX_FILE", index_path);
+
+    const read_tree_output = try runGitCapture(allocator, &.{ "git", "read-tree", "HEAD" }, &env_map, diagnostics);
+    allocator.free(read_tree_output);
+
+    try applyPatchesToIndexWithDiagnostics(allocator, document.patches, ordered, &env_map, diagnostics);
+
+    const diff = try collectCanonicalIndexDiff(allocator, &env_map, diagnostics);
+    defer allocator.free(diff);
+    const blocks = try canonicalDiffBlocksFromDiff(allocator, diff, diagnostics);
+    defer freeCanonicalDiffBlocks(allocator, blocks);
+
+    const compact_body = try compactDocumentBodyWithBlocks(
+        allocator,
+        document.source,
+        heading.body_start,
+        blocks,
+        diagnostics,
+    );
+    defer allocator.free(compact_body);
+
+    const tree = try runGitCapture(allocator, &.{ "git", "write-tree" }, &env_map, diagnostics);
+    defer allocator.free(tree);
+    const trimmed_tree = std.mem.trimEnd(u8, tree, "\r\n");
+
+    const message_path = try std.fmt.allocPrint(allocator, "{s}/message-{x}", .{ temp_dir, nonce });
+    defer allocator.free(message_path);
+    defer std.fs.cwd().deleteFile(message_path) catch {};
+
+    var message: std.ArrayList(u8) = .empty;
+    defer message.deinit(allocator);
+    try message.writer(allocator).print("{s}\n\n", .{heading.subject});
+    try message.appendSlice(allocator, compact_body);
+    if (!std.mem.endsWith(u8, compact_body, "\n")) {
+        try message.append(allocator, '\n');
+    }
+    try std.fs.cwd().writeFile(.{ .sub_path = message_path, .data = message.items });
+
+    const commit_id = try runGitCapture(
+        allocator,
+        &.{ "git", "commit-tree", trimmed_tree, "-p", "HEAD", "-F", message_path },
+        null,
+        diagnostics,
+    );
+    errdefer allocator.free(commit_id);
+    const trimmed_commit = std.mem.trimEnd(u8, commit_id, "\r\n");
+    const update_output = try runGitCapture(
+        allocator,
+        &.{ "git", "update-ref", "HEAD", trimmed_commit },
+        null,
+        diagnostics,
+    );
+    allocator.free(update_output);
+
+    const reset_output = try runGitCapture(allocator, &.{ "git", "reset", "--hard", "HEAD" }, null, diagnostics);
+    allocator.free(reset_output);
+
+    return commit_id;
+}
+
+fn applyPatchesToIndexWithDiagnostics(
+    allocator: std.mem.Allocator,
+    patches: []const Patch,
+    ordered_indices: []const usize,
+    env_map: *const std.process.EnvMap,
+    diagnostics: ?*Diagnostic,
+) !void {
+    for (ordered_indices) |patch_index| {
+        const patch = patches[patch_index];
+        try runGitWithInputForPatch(
+            allocator,
+            &.{ "git", "apply", "--cached", "--unsafe-paths", "-" },
+            env_map,
+            patch,
+            diagnostics,
+        );
+    }
+}
+
 fn collectPatchFragments(
     allocator: std.mem.Allocator,
     source: []const u8,
@@ -906,14 +1095,63 @@ fn concatenatePatchFragments(
 }
 
 fn collectGitWorktreeDiff(allocator: std.mem.Allocator, diagnostics: ?*Diagnostic) ![]u8 {
-    return runGitForDiff(allocator, &.{ "git", "diff", "--no-ext-diff", "HEAD" }, diagnostics);
+    return runGitForDiff(
+        allocator,
+        &.{
+            "git",
+            "diff",
+            "--no-ext-diff",
+            "--no-color",
+            "--no-renames",
+            "--diff-algorithm=histogram",
+            "--no-indent-heuristic",
+            "--unified=3",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "HEAD",
+        },
+        diagnostics,
+    );
 }
 
 fn collectGitSpecDiff(allocator: std.mem.Allocator, spec: []const u8, diagnostics: ?*Diagnostic) ![]u8 {
     if (looksLikeRevisionRange(spec)) {
-        return runGitForDiff(allocator, &.{ "git", "diff", "--no-ext-diff", spec }, diagnostics);
+        return runGitForDiff(
+            allocator,
+            &.{
+                "git",
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                "--no-renames",
+                "--diff-algorithm=histogram",
+                "--no-indent-heuristic",
+                "--unified=3",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                spec,
+            },
+            diagnostics,
+        );
     }
-    return runGitForDiff(allocator, &.{ "git", "show", "--format=", "--no-ext-diff", spec }, diagnostics);
+    return runGitForDiff(
+        allocator,
+        &.{
+            "git",
+            "show",
+            "--format=",
+            "--no-ext-diff",
+            "--no-color",
+            "--no-renames",
+            "--diff-algorithm=histogram",
+            "--no-indent-heuristic",
+            "--unified=3",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            spec,
+        },
+        diagnostics,
+    );
 }
 
 fn runGitForDiff(
@@ -948,6 +1186,196 @@ fn runGitForDiff(
 
 fn looksLikeRevisionRange(spec: []const u8) bool {
     return std.mem.indexOf(u8, spec, "..") != null;
+}
+
+fn collectCanonicalIndexDiff(
+    allocator: std.mem.Allocator,
+    env_map: *const std.process.EnvMap,
+    diagnostics: ?*Diagnostic,
+) ![]u8 {
+    return runGitCapture(
+        allocator,
+        &.{
+            "git",
+            "diff",
+            "--cached",
+            "--no-ext-diff",
+            "--no-color",
+            "--no-renames",
+            "--diff-algorithm=histogram",
+            "--no-indent-heuristic",
+            "--unified=3",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "HEAD",
+        },
+        env_map,
+        diagnostics,
+    );
+}
+
+fn collectCanonicalCommitDiff(
+    allocator: std.mem.Allocator,
+    parent: []const u8,
+    commit: []const u8,
+    diagnostics: ?*Diagnostic,
+) ![]u8 {
+    return runGitCapture(
+        allocator,
+        &.{
+            "git",
+            "diff-tree",
+            "-p",
+            "-r",
+            "--no-commit-id",
+            "--no-ext-diff",
+            "--no-color",
+            "--no-renames",
+            "--diff-algorithm=histogram",
+            "--no-indent-heuristic",
+            "--unified=3",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            parent,
+            commit,
+        },
+        null,
+        diagnostics,
+    );
+}
+
+fn ensureCleanWorktree(allocator: std.mem.Allocator) !void {
+    const unstaged = try runGitExitCode(
+        allocator,
+        &.{ "git", "diff", "--quiet", "--no-ext-diff", "HEAD", "--" },
+        null,
+    );
+    const staged = try runGitExitCode(
+        allocator,
+        &.{ "git", "diff", "--cached", "--quiet", "--no-ext-diff", "HEAD", "--" },
+        null,
+    );
+    if (unstaged != 0 or staged != 0) return error.WorktreeNotClean;
+}
+
+fn runGitExitCode(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    env_map: ?*const std.process.EnvMap,
+) !u8 {
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv,
+        .env_map = env_map,
+        .max_output_bytes = 128 * 1024,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .Exited => |code| return @intCast(code),
+        else => return error.GitDiffFailed,
+    }
+}
+
+fn runGitCapture(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    env_map: ?*const std.process.EnvMap,
+    diagnostics: ?*Diagnostic,
+) ![]u8 {
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv,
+        .env_map = env_map,
+        .max_output_bytes = 16 * 1024 * 1024,
+    });
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .Exited => |code| {
+            if (code == 0) return result.stdout;
+        },
+        else => {},
+    }
+
+    try emitDiagnostic(
+        "{s}",
+        .{result.stderr},
+        diagnostics,
+        .git_diff_failed,
+        .{ .detail = if (result.stderr.len == 0) null else result.stderr },
+    );
+    allocator.free(result.stdout);
+    return error.GitDiffFailed;
+}
+
+fn runGitWithInputForPatch(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    env_map: *const std.process.EnvMap,
+    patch: Patch,
+    diagnostics: ?*Diagnostic,
+) !void {
+    var child = std.process.Child.init(argv, allocator);
+    child.env_map = env_map;
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    try child.spawn();
+    errdefer {
+        _ = child.kill() catch {};
+    }
+
+    {
+        const stdin = child.stdin.?;
+        try stdin.writeAll(patch.diff);
+        if (!std.mem.endsWith(u8, patch.diff, "\n")) {
+            try stdin.writeAll("\n");
+        }
+        stdin.close();
+        child.stdin = null;
+    }
+
+    var stdout: std.ArrayList(u8) = .empty;
+    defer stdout.deinit(allocator);
+    var stderr: std.ArrayList(u8) = .empty;
+    defer stderr.deinit(allocator);
+    try child.collectOutput(allocator, &stdout, &stderr, 128 * 1024);
+    const term = try child.wait();
+
+    switch (term) {
+        .Exited => |code| {
+            if (code == 0) return;
+            const detail = if (stderr.items.len != 0) stderr.items else stdout.items;
+            try emitDiagnostic(
+                "apply patch '{s}' failed with exit code {d}",
+                .{ patch.id, code },
+                diagnostics,
+                .apply_failed,
+                .{
+                    .patch_id = patch.id,
+                    .exit_code = @intCast(code),
+                    .detail = if (detail.len == 0) null else detail,
+                },
+            );
+        },
+        else => {
+            const detail = if (stderr.items.len != 0) stderr.items else stdout.items;
+            try emitDiagnostic(
+                "apply patch '{s}' terminated unexpectedly",
+                .{patch.id},
+                diagnostics,
+                .apply_terminated,
+                .{
+                    .patch_id = patch.id,
+                    .detail = if (detail.len == 0) null else detail,
+                },
+            );
+        },
+    }
+    return error.ApplyFailed;
 }
 
 fn parseDiffSections(
@@ -989,6 +1417,46 @@ fn freeDiffSections(allocator: std.mem.Allocator, sections: []DiffSection) void 
         allocator.free(section.hunks);
     }
     allocator.free(sections);
+}
+
+fn canonicalDiffBlocksFromDiff(
+    allocator: std.mem.Allocator,
+    diff: []const u8,
+    diagnostics: ?*Diagnostic,
+) ![]CanonicalDiffBlock {
+    const sections = try parseDiffSections(allocator, diff, diagnostics);
+    defer freeDiffSections(allocator, sections);
+
+    var blocks: std.ArrayList(CanonicalDiffBlock) = .empty;
+    errdefer {
+        for (blocks.items) |block| {
+            allocator.free(block.text);
+        }
+        blocks.deinit(allocator);
+    }
+
+    for (sections) |section| {
+        if (section.hunks.len == 0) {
+            try blocks.append(allocator, .{ .text = try allocator.dupe(u8, section.body) });
+            continue;
+        }
+        for (section.hunks) |hunk| {
+            var block: std.ArrayList(u8) = .empty;
+            defer block.deinit(allocator);
+            try block.appendSlice(allocator, section.prelude);
+            try block.appendSlice(allocator, hunk.body);
+            try blocks.append(allocator, .{ .text = try block.toOwnedSlice(allocator) });
+        }
+    }
+
+    return blocks.toOwnedSlice(allocator);
+}
+
+fn freeCanonicalDiffBlocks(allocator: std.mem.Allocator, blocks: []const CanonicalDiffBlock) void {
+    for (blocks) |block| {
+        allocator.free(block.text);
+    }
+    allocator.free(blocks);
 }
 
 fn parseDiffSection(
@@ -1373,6 +1841,433 @@ fn generatedPatchIdentityBody(diff_body: []const u8) []const u8 {
     return diff_body[@min(first_line_end, diff_body.len)..];
 }
 
+fn parseInitialHeading(source: []const u8) ?InitialHeading {
+    const line_end_with_newline = nextLineEnd(source, 0);
+    const line_end = if (line_end_with_newline > 0 and
+        line_end_with_newline <= source.len and
+        source[line_end_with_newline - 1] == '\n')
+        line_end_with_newline - 1
+    else
+        line_end_with_newline;
+    const line = std.mem.trimEnd(u8, source[0..line_end], "\r");
+    if (line.len == 0 or line[0] != '#') return null;
+    if (line.len >= 2 and line[1] == '#') return null;
+    if (line.len > 1 and line[1] != ' ' and line[1] != '\t') return null;
+
+    var subject = std.mem.trim(u8, line[1..], " \t");
+    if (subject.len != 0 and subject[subject.len - 1] == '#') {
+        subject = std.mem.trimEnd(u8, subject[0 .. subject.len - 1], " \t");
+    }
+    if (subject.len == 0) return null;
+
+    var body_start = line_end_with_newline;
+    while (body_start < source.len and (source[body_start] == '\n' or source[body_start] == '\r')) {
+        body_start += 1;
+    }
+
+    return .{ .subject = subject, .body_start = body_start };
+}
+
+fn compactDocumentBodyWithBlocks(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    body_start: usize,
+    blocks: []const CanonicalDiffBlock,
+    diagnostics: ?*Diagnostic,
+) ![]u8 {
+    _ = diagnostics;
+    var markdown_document = try markdown.parse(allocator, source);
+    defer markdown_document.deinit();
+
+    var diff_nodes: std.ArrayList(markdown.Node) = .empty;
+    defer diff_nodes.deinit(allocator);
+    try collectCodeBlockNodes(allocator, markdown_document.children, "diff", &diff_nodes);
+
+    const lines = try flattenDiffBlockLines(allocator, blocks);
+    defer allocator.free(lines);
+    const used = try allocator.alloc(bool, lines.len);
+    defer allocator.free(used);
+    @memset(used, false);
+
+    var builder: std.ArrayList(u8) = .empty;
+    defer builder.deinit(allocator);
+
+    var cursor = body_start;
+    for (diff_nodes.items) |node| {
+        const span_start: usize = @intCast(node.span_start);
+        const span_end: usize = @intCast(node.span_end);
+        if (span_end <= body_start) continue;
+        if (span_start < cursor) return error.OverlappingPatchFences;
+
+        try builder.appendSlice(allocator, source[cursor..span_start]);
+
+        const normalized = try ensureTrailingNewline(allocator, node.text);
+        defer allocator.free(normalized);
+        const ranges = try findLineRangesForText(allocator, normalized, lines, used);
+        defer allocator.free(ranges);
+        markRangesUsed(lines, used, ranges);
+
+        const range_text = try formatLineRanges(allocator, ranges, blocks);
+        defer allocator.free(range_text);
+        const ref_info = try compactRefInfo(allocator, node.info, range_text);
+        defer allocator.free(ref_info);
+        try writeEmptyFenceReplacement(allocator, &builder, ref_info);
+
+        cursor = span_end;
+    }
+
+    try builder.appendSlice(allocator, source[cursor..]);
+    return builder.toOwnedSlice(allocator);
+}
+
+fn expandCompactRecipeWithBlocks(
+    allocator: std.mem.Allocator,
+    owned_source: []u8,
+    blocks: []const CanonicalDiffBlock,
+    diagnostics: ?*Diagnostic,
+) ![]u8 {
+    _ = diagnostics;
+    var markdown_document = try markdown.parse(allocator, owned_source);
+    defer markdown_document.deinit();
+
+    var ref_nodes: std.ArrayList(markdown.Node) = .empty;
+    defer ref_nodes.deinit(allocator);
+    try collectCodeBlockNodes(allocator, markdown_document.children, "latch-ref", &ref_nodes);
+    if (ref_nodes.items.len == 0) return error.NoLatchRefs;
+
+    var builder: std.ArrayList(u8) = .empty;
+    defer builder.deinit(allocator);
+
+    var cursor: usize = 0;
+    for (ref_nodes.items) |node| {
+        const span_start: usize = @intCast(node.span_start);
+        const span_end: usize = @intCast(node.span_end);
+        if (span_start < cursor) return error.OverlappingPatchFences;
+        try builder.appendSlice(allocator, owned_source[cursor..span_start]);
+
+        const parsed = try parseLatchRefInfo(allocator, node.info);
+        defer allocator.free(parsed.metadata);
+        defer allocator.free(parsed.ranges);
+
+        const body = try materializeRanges(allocator, parsed.ranges, blocks);
+        defer allocator.free(body);
+        try writeDiffFenceReplacement(allocator, &builder, parsed.metadata, body);
+
+        cursor = span_end;
+    }
+
+    try builder.appendSlice(allocator, owned_source[cursor..]);
+    return builder.toOwnedSlice(allocator);
+}
+
+const ParsedLatchRef = struct {
+    metadata: []const u8,
+    ranges: []const LineRange,
+};
+
+fn collectCodeBlockNodes(
+    allocator: std.mem.Allocator,
+    nodes: []const markdown.Node,
+    language: []const u8,
+    output: *std.ArrayList(markdown.Node),
+) !void {
+    for (nodes) |node| {
+        if (node.kind == .code_block) {
+            if (codeBlockLanguage(node.info)) |node_language| {
+                if (std.mem.eql(u8, node_language, language)) {
+                    try output.append(allocator, node);
+                }
+            }
+        }
+        if (node.children.len != 0) {
+            try collectCodeBlockNodes(allocator, node.children, language, output);
+        }
+    }
+}
+
+fn codeBlockLanguage(info: []const u8) ?[]const u8 {
+    var token_iter = std.mem.tokenizeAny(u8, info, " \t\r\n");
+    return token_iter.next();
+}
+
+fn ensureTrailingNewline(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    if (std.mem.endsWith(u8, text, "\n")) return allocator.dupe(u8, text);
+    var buffer = try allocator.alloc(u8, text.len + 1);
+    @memcpy(buffer[0..text.len], text);
+    buffer[text.len] = '\n';
+    return buffer;
+}
+
+fn flattenDiffBlockLines(allocator: std.mem.Allocator, blocks: []const CanonicalDiffBlock) ![]DiffLineRef {
+    var lines: std.ArrayList(DiffLineRef) = .empty;
+    defer lines.deinit(allocator);
+    for (blocks, 0..) |block, block_index| {
+        var start: usize = 0;
+        var line_index: usize = 1;
+        while (start < block.text.len) : (line_index += 1) {
+            const end = nextLineEnd(block.text, start);
+            try lines.append(allocator, .{
+                .block_index = block_index,
+                .line_index = line_index,
+                .text = block.text[start..end],
+            });
+            start = end;
+        }
+    }
+    return lines.toOwnedSlice(allocator);
+}
+
+fn findLineRangesForText(
+    allocator: std.mem.Allocator,
+    needle: []const u8,
+    lines: []const DiffLineRef,
+    used: []const bool,
+) ![]LineRange {
+    if (needle.len == 0) return error.EmptyDiffBody;
+    for (lines, 0..) |_, start_index| {
+        if (used[start_index]) continue;
+        var offset: usize = 0;
+        var line_index = start_index;
+        var matched_lines: std.ArrayList(DiffLineRef) = .empty;
+        defer matched_lines.deinit(allocator);
+        while (offset < needle.len and line_index < lines.len and !used[line_index]) : (line_index += 1) {
+            const line = lines[line_index].text;
+            if (std.mem.startsWith(u8, needle[offset..], line)) {
+                try matched_lines.append(allocator, lines[line_index]);
+                offset += line.len;
+                continue;
+            }
+            if (std.mem.startsWith(u8, line, "index ")) continue;
+            break;
+        }
+        if (offset == needle.len and matched_lines.items.len != 0) {
+            return rangesForLineSpan(allocator, matched_lines.items);
+        }
+    }
+    return error.UnmatchedDiffBody;
+}
+
+fn rangesForLineSpan(allocator: std.mem.Allocator, span: []const DiffLineRef) ![]LineRange {
+    std.debug.assert(span.len != 0);
+    var ranges: std.ArrayList(LineRange) = .empty;
+    defer ranges.deinit(allocator);
+
+    var current: LineRange = .{
+        .block_index = span[0].block_index,
+        .start_line = span[0].line_index,
+        .end_line = span[0].line_index,
+    };
+    for (span[1..]) |line| {
+        if (line.block_index == current.block_index and line.line_index == current.end_line + 1) {
+            current.end_line = line.line_index;
+            continue;
+        }
+        try ranges.append(allocator, current);
+        current = .{
+            .block_index = line.block_index,
+            .start_line = line.line_index,
+            .end_line = line.line_index,
+        };
+    }
+    try ranges.append(allocator, current);
+    return ranges.toOwnedSlice(allocator);
+}
+
+fn markRangesUsed(lines: []const DiffLineRef, used: []bool, ranges: []const LineRange) void {
+    for (lines, 0..) |line, index| {
+        for (ranges) |range| {
+            if (line.block_index == range.block_index and
+                line.line_index >= range.start_line and
+                line.line_index <= range.end_line)
+            {
+                used[index] = true;
+                break;
+            }
+        }
+    }
+}
+
+fn formatLineRanges(
+    allocator: std.mem.Allocator,
+    ranges: []const LineRange,
+    blocks: []const CanonicalDiffBlock,
+) ![]u8 {
+    var builder: std.ArrayList(u8) = .empty;
+    defer builder.deinit(allocator);
+    for (ranges, 0..) |range, index| {
+        if (index != 0) try builder.append(allocator, ',');
+        const block_line_count = countBlockLines(blocks[range.block_index].text);
+        if (range.end_line == block_line_count) {
+            try builder.writer(allocator).print("{d}:{d}..$", .{ range.block_index + 1, range.start_line });
+        } else {
+            try builder.writer(allocator).print(
+                "{d}:{d}..{d}",
+                .{ range.block_index + 1, range.start_line, range.end_line },
+            );
+        }
+    }
+    return builder.toOwnedSlice(allocator);
+}
+
+fn countBlockLines(text: []const u8) usize {
+    var count: usize = 0;
+    var start: usize = 0;
+    while (start < text.len) : (count += 1) {
+        start = nextLineEnd(text, start);
+    }
+    return count;
+}
+
+fn compactRefInfo(allocator: std.mem.Allocator, diff_info: []const u8, ranges: []const u8) ![]u8 {
+    var token_iter = std.mem.tokenizeAny(u8, diff_info, " \t\r\n");
+    const language = token_iter.next() orelse return error.InvalidPatchFence;
+    if (!std.mem.eql(u8, language, "diff")) return error.InvalidPatchFence;
+
+    var builder: std.ArrayList(u8) = .empty;
+    defer builder.deinit(allocator);
+    try builder.appendSlice(allocator, "latch-ref");
+    while (token_iter.next()) |token| {
+        try builder.append(allocator, ' ');
+        try builder.appendSlice(allocator, token);
+    }
+    try builder.writer(allocator).print(" ranges={s}", .{ranges});
+    return builder.toOwnedSlice(allocator);
+}
+
+fn writeEmptyFenceReplacement(
+    allocator: std.mem.Allocator,
+    builder: *std.ArrayList(u8),
+    info: []const u8,
+) !void {
+    try builder.writer(allocator).print("```{s}\n```", .{info});
+}
+
+fn writeDiffFenceReplacement(
+    allocator: std.mem.Allocator,
+    builder: *std.ArrayList(u8),
+    metadata: []const u8,
+    body: []const u8,
+) !void {
+    const fence_len = requiredBacktickFenceLen("", body);
+    try builder.appendNTimes(allocator, '`', fence_len);
+    try builder.writer(allocator).print("diff {s}\n", .{metadata});
+    try builder.appendSlice(allocator, body);
+    if (!std.mem.endsWith(u8, body, "\n")) {
+        try builder.append(allocator, '\n');
+    }
+    try builder.appendNTimes(allocator, '`', fence_len);
+}
+
+fn parseLatchRefInfo(allocator: std.mem.Allocator, info: []const u8) !ParsedLatchRef {
+    var token_iter = std.mem.tokenizeAny(u8, info, " \t\r\n");
+    const language = token_iter.next() orelse return error.InvalidLatchRef;
+    if (!std.mem.eql(u8, language, "latch-ref")) return error.InvalidLatchRef;
+
+    var metadata: std.ArrayList(u8) = .empty;
+    errdefer metadata.deinit(allocator);
+    var parsed_ranges: ?[]LineRange = null;
+    errdefer if (parsed_ranges) |ranges| allocator.free(ranges);
+    var saw_id = false;
+
+    while (token_iter.next()) |token| {
+        const eq_index = std.mem.indexOfScalar(u8, token, '=') orelse return error.InvalidLatchRef;
+        const key = token[0..eq_index];
+        const value = token[eq_index + 1 ..];
+        if (std.mem.eql(u8, key, "ranges")) {
+            if (parsed_ranges != null) return error.InvalidLatchRef;
+            parsed_ranges = try parseLineRanges(allocator, value);
+            continue;
+        }
+        if (std.mem.eql(u8, key, "id")) saw_id = value.len != 0;
+        if (!std.mem.eql(u8, key, "id") and
+            !std.mem.eql(u8, key, "depends-on") and
+            !std.mem.eql(u8, key, "part"))
+        {
+            return error.InvalidLatchRef;
+        }
+        if (metadata.items.len != 0) try metadata.append(allocator, ' ');
+        try metadata.appendSlice(allocator, token);
+    }
+
+    if (!saw_id or parsed_ranges == null) return error.InvalidLatchRef;
+    return .{
+        .metadata = try metadata.toOwnedSlice(allocator),
+        .ranges = parsed_ranges.?,
+    };
+}
+
+fn parseLineRanges(allocator: std.mem.Allocator, text: []const u8) ![]LineRange {
+    var ranges: std.ArrayList(LineRange) = .empty;
+    errdefer ranges.deinit(allocator);
+
+    var iter = std.mem.splitScalar(u8, text, ',');
+    while (iter.next()) |raw| {
+        const item = std.mem.trim(u8, raw, " \t\r\n");
+        if (item.len == 0) continue;
+        const colon = std.mem.indexOfScalar(u8, item, ':') orelse return error.InvalidLatchRefRange;
+        const dots = std.mem.indexOf(u8, item[colon + 1 ..], "..") orelse return error.InvalidLatchRefRange;
+        const range_start = colon + 1;
+        const range_mid = range_start + dots;
+        const range_end = range_mid + 2;
+
+        const block_number = try std.fmt.parseInt(usize, item[0..colon], 10);
+        const start_line = try std.fmt.parseInt(usize, item[range_start..range_mid], 10);
+        const end_line = if (std.mem.eql(u8, item[range_end..], "$"))
+            std.math.maxInt(usize)
+        else
+            try std.fmt.parseInt(usize, item[range_end..], 10);
+        if (block_number == 0 or start_line == 0) return error.InvalidLatchRefRange;
+        if (end_line != std.math.maxInt(usize) and end_line < start_line) return error.InvalidLatchRefRange;
+        try ranges.append(allocator, .{
+            .block_index = block_number - 1,
+            .start_line = start_line,
+            .end_line = end_line,
+        });
+    }
+
+    if (ranges.items.len == 0) return error.InvalidLatchRefRange;
+    return ranges.toOwnedSlice(allocator);
+}
+
+fn materializeRanges(
+    allocator: std.mem.Allocator,
+    ranges: []const LineRange,
+    blocks: []const CanonicalDiffBlock,
+) ![]u8 {
+    var builder: std.ArrayList(u8) = .empty;
+    defer builder.deinit(allocator);
+    for (ranges) |range| {
+        if (range.block_index >= blocks.len) return error.InvalidLatchRefRange;
+        const text = blocks[range.block_index].text;
+        const line_count = countBlockLines(text);
+        const end_line = if (range.end_line == std.math.maxInt(usize)) line_count else range.end_line;
+        if (range.start_line == 0 or range.start_line > end_line or end_line > line_count) {
+            return error.InvalidLatchRefRange;
+        }
+        const slice = lineRangeSlice(text, range.start_line, end_line) orelse return error.InvalidLatchRefRange;
+        try builder.appendSlice(allocator, slice);
+    }
+    return builder.toOwnedSlice(allocator);
+}
+
+fn lineRangeSlice(text: []const u8, start_line: usize, end_line: usize) ?[]const u8 {
+    var current_line: usize = 1;
+    var line_start: usize = 0;
+    var start_offset: ?usize = null;
+    var end_offset: ?usize = null;
+    while (line_start < text.len) : (current_line += 1) {
+        const line_end = nextLineEnd(text, line_start);
+        if (current_line == start_line) start_offset = line_start;
+        if (current_line == end_line) {
+            end_offset = line_end;
+            break;
+        }
+        line_start = line_end;
+    }
+    if (start_offset == null or end_offset == null) return null;
+    return text[start_offset.?..end_offset.?];
+}
+
 fn parsePatchNode(
     allocator: std.mem.Allocator,
     source: []const u8,
@@ -1600,6 +2495,71 @@ fn lineNumberForOffset(source: []const u8, offset: usize) usize {
 fn logError(comptime format: []const u8, args: anytype) void {
     if (builtin.is_test) return;
     std.log.err(format, args);
+}
+
+test "compact recipe stores line ranges and expands diff fences" {
+    const block_text =
+        \\diff --git a/file.txt b/file.txt
+        \\index 1111111..2222222 100644
+        \\--- a/file.txt
+        \\+++ b/file.txt
+        \\@@ -1,3 +1,4 @@
+        \\ a
+        \\-b
+        \\+bee
+        \\ c
+        \\+d
+        \\
+    ;
+    const blocks = [_]CanonicalDiffBlock{.{ .text = block_text }};
+    const source =
+        \\# Split test
+        \\
+        \\First half.
+        \\
+        \\```diff id=core part=1
+        \\diff --git a/file.txt b/file.txt
+        \\index 1111111..2222222 100644
+        \\--- a/file.txt
+        \\+++ b/file.txt
+        \\@@ -1,3 +1,4 @@
+        \\ a
+        \\-b
+        \\```
+        \\
+        \\Second half.
+        \\
+        \\```diff id=core part=2
+        \\+bee
+        \\ c
+        \\+d
+        \\```
+        \\
+    ;
+
+    const heading = parseInitialHeading(source).?;
+    try std.testing.expectEqualStrings("Split test", heading.subject);
+
+    const compact = try compactDocumentBodyWithBlocks(
+        std.testing.allocator,
+        source,
+        heading.body_start,
+        &blocks,
+        null,
+    );
+    defer std.testing.allocator.free(compact);
+
+    try std.testing.expect(std.mem.indexOf(u8, compact, "```latch-ref id=core part=1 ranges=1:1..7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compact, "```latch-ref id=core part=2 ranges=1:8..$") != null);
+
+    const compact_source = try std.fmt.allocPrint(std.testing.allocator, "# {s}\n\n{s}", .{ heading.subject, compact });
+    defer std.testing.allocator.free(compact_source);
+    const expanded = try expandCompactRecipeWithBlocks(std.testing.allocator, compact_source, &blocks, null);
+    defer std.testing.allocator.free(expanded);
+
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "```diff id=core part=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "```diff id=core part=2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "+bee\n c\n+d\n```") != null);
 }
 
 test "extracts review fences without executable diffs" {

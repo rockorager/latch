@@ -102,6 +102,19 @@ cat change.latch.md | latch apply
 latch apply --dir /tmp/repo -
 ```
 
+Create a compact Latch Git commit, then reconstruct the full document
+from that commit:
+
+```sh
+latch commit change.latch.md
+latch show HEAD > change.latch.md
+```
+
+`latch commit` uses the document's first H1 as the Git commit subject
+and currently requires a clean tracked worktree. The commit body stores
+the prose with compact `latch-ref` fences rather than full diff bodies;
+`latch show` expands those refs from the commit's canonical parent diff.
+
 Extract reviewer comments from a Latch document path or stdin:
 
 ```sh
@@ -129,9 +142,13 @@ run `latch review` from the current buffer.
 3. Rewrite the generated draft into a real patch narrative.
 4. Keep executable `diff` fences intact while reordering sections and
    improving the prose.
-5. Reviewers may add non-executable `review` fences with optional
+5. Optionally run `latch commit change.latch.md` to create a Git commit
+   whose message stores a compact Latch recipe.
+6. Use `latch show <commit>` to reconstruct the full Latch document from
+   such a commit.
+7. Reviewers may add non-executable `review` fences with optional
    `id=patch-id` metadata.
-6. Run `latch review` to extract those comments for the next authoring
+8. Run `latch review` to extract those comments for the next authoring
    pass, or `latch apply` to materialize the document onto a target tree.
 
 Generated drafts are intentionally mechanical. They preserve
@@ -167,6 +184,8 @@ Short version:
 - supported patch metadata keys are `id`, `depends-on`, and `part`
 - review fences are fenced code blocks whose info string starts with
   `review`; optional `id=patch-id` scopes a comment to a patch
+- compact Git commits store `latch-ref` fences with `ranges=...`; `latch
+  show` expands them back into executable `diff` fences
 - `depends-on` controls apply order, not Markdown position
 - split patches reuse the same `id` with contiguous `part=1..N`
 

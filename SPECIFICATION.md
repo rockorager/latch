@@ -27,6 +27,10 @@ format contract.
 - A **review fence** is a fenced code block recognized as reviewer
   commentary by the rules in this specification.
 - A **review** is one review fence after review metadata has been parsed.
+- A **compact Latch recipe** is Markdown stored in a Git commit body that
+  contains `latch-ref` fences instead of executable `diff` fences.
+- A **latch-ref fence** is a compact placeholder for a diff fence. It is
+  expanded from the commit's canonical parent diff by `latch show`.
 
 ## Patch Fence Recognition
 
@@ -193,6 +197,48 @@ application.
 
 If patch application fails for any patch, application stops and the
 document is not considered successfully applied.
+
+## Compact Git Carriage
+
+A compact Latch commit stores the code change in the normal Git commit
+tree and a compact Latch recipe in the Git commit message body. The
+first H1 of the source Latch document becomes the Git commit subject;
+the stored recipe omits that H1. `latch show` restores the subject as an
+H1 before expanding the recipe.
+
+A compact recipe uses fenced code blocks whose info string starts with
+`latch-ref`. A `latch-ref` fence supports the normal patch metadata
+keys `id`, `depends-on`, and `part`, plus a required `ranges` key.
+Unsupported metadata keys are invalid.
+
+The `ranges` value is a comma-separated list of line ranges:
+
+```text
+ranges=<block>:<start>..<end>[,<block>:<start>..<end>...]
+```
+
+- `block` is a 1-based canonical diff block index.
+- `start` is a 1-based line number within that block.
+- `end` is a 1-based line number or `$` for the final line of that
+  block.
+- line ranges are inclusive.
+
+For compact carriage, the canonical parent diff is produced with
+`--no-ext-diff`, `--no-color`, `--no-renames`,
+`--diff-algorithm=histogram`, `--no-indent-heuristic`, `--unified=3`,
+`--src-prefix=a/`, and `--dst-prefix=b/`, then split into canonical diff
+blocks. A block is either a whole file diff with no hunks, or one file
+prelude plus one hunk. This mirrors the block structure emitted by
+`latch draft`.
+
+`latch show <commit>` reconstructs a full Latch document by replacing
+each `latch-ref` fence with a `diff` fence carrying the same `id`,
+`depends-on`, and `part` metadata. The diff fence body is the
+concatenation of the referenced canonical block line ranges.
+
+Compact carriage can represent arbitrary splits on diff line boundaries.
+It cannot represent Latch patches whose intermediate diff text is not
+present in the final parent-to-commit diff.
 
 ## Validation Summary
 
