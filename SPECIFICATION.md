@@ -237,6 +237,13 @@ each `latch-ref` fence with a `diff` fence carrying the same `id`,
 `depends-on`, and `part` metadata. The diff fence body is the
 concatenation of the referenced canonical block line ranges.
 
+When stdout is not a TTY, `latch show` writes the raw reconstructed
+Markdown document. When stdout is a TTY, implementations may render a
+human-friendly ANSI view through a pager. Pager selection should prefer
+`LATCH_PAGER`, then `GIT_PAGER`, then `PAGER`, then `less -R`. A selected
+pager of `cat` or the empty string disables paging. A non-empty
+`NO_COLOR` environment variable disables ANSI color.
+
 Compact carriage can represent arbitrary splits on diff line boundaries.
 It cannot represent Latch patches whose intermediate diff text is not
 present in the final parent-to-commit diff.

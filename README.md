@@ -114,7 +114,9 @@ latch show > change.latch.md
 and currently requires a clean tracked worktree. The commit body stores
 the prose with compact `latch-ref` fences rather than full diff bodies;
 `latch show` expands those refs from the commit's canonical parent diff
-and defaults to `HEAD`, like `git show`.
+and defaults to `HEAD`, like `git show`. When stdout is a TTY, it renders
+colored Markdown/diff output through a pager; when redirected, it writes
+raw reconstructed Markdown.
 
 Extract reviewer comments from a Latch document path or stdin:
 
@@ -129,6 +131,26 @@ Print the repo skill:
 ```sh
 latch skill
 ```
+
+## `latch show` paging
+
+`latch show` is human-friendly by default on a terminal and
+machine-friendly when redirected:
+
+```sh
+latch show              # render HEAD through a pager
+latch show > change.md  # write raw reconstructed Markdown
+```
+
+Pager selection follows:
+
+1. `LATCH_PAGER`
+2. `GIT_PAGER`
+3. `PAGER`
+4. `less -R`
+
+Set `LATCH_PAGER=cat` to skip paging. Set `NO_COLOR` to disable ANSI
+color.
 
 ## Editor integrations
 

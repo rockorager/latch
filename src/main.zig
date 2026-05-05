@@ -204,10 +204,262 @@ fn runShow(allocator: std.mem.Allocator, args: []const []const u8, diagnostics: 
     const document = try latch.showCommitWithDiagnostics(allocator, commit, diagnostics);
     defer allocator.free(document);
 
-    var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-    try stdout_writer.interface.writeAll(document);
-    try stdout_writer.interface.flush();
+    const stdout_file = std.fs.File.stdout();
+    if (!stdout_file.isTty()) {
+        var stdout_buffer: [4096]u8 = undefined;
+        var stdout_writer = stdout_file.writer(&stdout_buffer);
+        try stdout_writer.interface.writeAll(document);
+        try stdout_writer.interface.flush();
+        return;
+    }
+
+    const color = shouldColorShowOutput();
+    const rendered = try renderShowMarkdown(allocator, document, color);
+    defer allocator.free(rendered);
+
+    const pager = showPager();
+    if (pagerDisablesPaging(pager)) {
+        var stdout_buffer: [4096]u8 = undefined;
+        var stdout_writer = stdout_file.writer(&stdout_buffer);
+        try stdout_writer.interface.writeAll(rendered);
+        try stdout_writer.interface.flush();
+        return;
+    }
+
+    try pageShowOutput(allocator, pager, rendered);
+}
+
+const RenderFence = struct {
+    marker: u8,
+    count: usize,
+    info: []const u8,
+};
+
+fn renderShowMarkdown(allocator: std.mem.Allocator, document: []const u8, color: bool) ![]u8 {
+    var rendered: std.ArrayList(u8) = .empty;
+    defer rendered.deinit(allocator);
+
+    var in_code = false;
+    var code_marker: u8 = 0;
+    var code_count: usize = 0;
+    var code_language: []const u8 = "";
+
+    var line_start: usize = 0;
+    while (line_start < document.len) {
+        const line_end = nextLineEnd(document, line_start);
+        const line = document[line_start..line_end];
+        const content = std.mem.trimEnd(u8, line, "\r\n");
+
+        if (in_code) {
+            if (isClosingRenderFence(content, code_marker, code_count)) {
+                if (std.mem.eql(u8, code_language, "diff")) {
+                    try writeDiffPrefix(allocator, &rendered, color);
+                }
+                try writeStyledLine(allocator, &rendered, line, color, "\x1b[2m");
+                in_code = false;
+                code_language = "";
+            } else if (std.mem.eql(u8, code_language, "diff")) {
+                try writeDiffLine(allocator, &rendered, line, color);
+            } else if (std.mem.eql(u8, code_language, "review")) {
+                try writeStyledLine(allocator, &rendered, line, color, "\x1b[33m");
+            } else {
+                try rendered.appendSlice(allocator, line);
+            }
+        } else if (parseRenderFence(content)) |fence| {
+            in_code = true;
+            code_marker = fence.marker;
+            code_count = fence.count;
+            code_language = renderFenceLanguage(fence.info);
+            if (std.mem.eql(u8, code_language, "diff")) {
+                try writeDiffPrefix(allocator, &rendered, color);
+            }
+            try writeStyledLine(allocator, &rendered, line, color, "\x1b[2m");
+        } else if (std.mem.startsWith(u8, content, "# ")) {
+            try writeStyledLine(allocator, &rendered, line, color, "\x1b[1;34m");
+        } else if (std.mem.startsWith(u8, content, "## ") or std.mem.startsWith(u8, content, "### ")) {
+            try writeStyledLine(allocator, &rendered, line, color, "\x1b[1;35m");
+        } else {
+            try rendered.appendSlice(allocator, line);
+        }
+
+        line_start = line_end;
+    }
+
+    return rendered.toOwnedSlice(allocator);
+}
+
+fn writeDiffLine(
+    allocator: std.mem.Allocator,
+    rendered: *std.ArrayList(u8),
+    line: []const u8,
+    color: bool,
+) !void {
+    try writeDiffPrefix(allocator, rendered, color);
+    const content = std.mem.trimEnd(u8, line, "\r\n");
+    if (std.mem.startsWith(u8, content, "+") and !std.mem.startsWith(u8, content, "+++")) {
+        try writeStyledLine(allocator, rendered, line, color, "\x1b[32m");
+    } else if (std.mem.startsWith(u8, content, "-") and !std.mem.startsWith(u8, content, "---")) {
+        try writeStyledLine(allocator, rendered, line, color, "\x1b[31m");
+    } else if (std.mem.startsWith(u8, content, "@@")) {
+        try writeHunkHeaderLine(allocator, rendered, line, color);
+    } else if (std.mem.startsWith(u8, content, "diff --git ") or
+        std.mem.startsWith(u8, content, "index ") or
+        std.mem.startsWith(u8, content, "---") or
+        std.mem.startsWith(u8, content, "+++"))
+    {
+        try writeStyledLine(allocator, rendered, line, color, "\x1b[2m");
+    } else {
+        try rendered.appendSlice(allocator, line);
+    }
+}
+
+fn writeDiffPrefix(
+    allocator: std.mem.Allocator,
+    rendered: *std.ArrayList(u8),
+    color: bool,
+) !void {
+    _ = color;
+    try rendered.appendSlice(allocator, "    ");
+}
+
+fn writeHunkHeaderLine(
+    allocator: std.mem.Allocator,
+    rendered: *std.ArrayList(u8),
+    line: []const u8,
+    color: bool,
+) !void {
+    if (!color) {
+        try rendered.appendSlice(allocator, line);
+        return;
+    }
+
+    const content = std.mem.trimEnd(u8, line, "\r\n");
+    const header_end = findHunkHeaderEnd(content) orelse {
+        try writeStyledLine(allocator, rendered, line, color, "\x1b[36m");
+        return;
+    };
+
+    try rendered.appendSlice(allocator, "\x1b[36m");
+    try rendered.appendSlice(allocator, line[0..header_end]);
+    try rendered.appendSlice(allocator, "\x1b[0m");
+    try rendered.appendSlice(allocator, line[header_end..]);
+}
+
+fn findHunkHeaderEnd(content: []const u8) ?usize {
+    if (!std.mem.startsWith(u8, content, "@@")) return null;
+    const second_marker = std.mem.indexOfPos(u8, content, 2, "@@") orelse return null;
+    return second_marker + 2;
+}
+
+fn writeStyledLine(
+    allocator: std.mem.Allocator,
+    rendered: *std.ArrayList(u8),
+    line: []const u8,
+    color: bool,
+    style: []const u8,
+) !void {
+    if (!color) {
+        try rendered.appendSlice(allocator, line);
+        return;
+    }
+    try rendered.appendSlice(allocator, style);
+    try rendered.appendSlice(allocator, line);
+    try rendered.appendSlice(allocator, "\x1b[0m");
+}
+
+fn parseRenderFence(content: []const u8) ?RenderFence {
+    const indent = leadingSpaces(content);
+    if (indent > 3 or indent >= content.len) return null;
+    const marker = content[indent];
+    if (marker != '`' and marker != '~') return null;
+
+    var count: usize = 0;
+    while (indent + count < content.len and content[indent + count] == marker) {
+        count += 1;
+    }
+    if (count < 3) return null;
+
+    return .{
+        .marker = marker,
+        .count = count,
+        .info = std.mem.trim(u8, content[indent + count ..], " \t"),
+    };
+}
+
+fn isClosingRenderFence(content: []const u8, marker: u8, count: usize) bool {
+    const indent = leadingSpaces(content);
+    if (indent > 3 or indent >= content.len) return false;
+    if (content[indent] != marker) return false;
+
+    var closing_count: usize = 0;
+    while (indent + closing_count < content.len and content[indent + closing_count] == marker) {
+        closing_count += 1;
+    }
+    if (closing_count < count) return false;
+
+    const rest = std.mem.trim(u8, content[indent + closing_count ..], " \t");
+    return rest.len == 0;
+}
+
+fn renderFenceLanguage(info: []const u8) []const u8 {
+    var token_iter = std.mem.tokenizeAny(u8, info, " \t\r\n");
+    return token_iter.next() orelse "";
+}
+
+fn leadingSpaces(content: []const u8) usize {
+    var count: usize = 0;
+    while (count < content.len and content[count] == ' ') {
+        count += 1;
+    }
+    return count;
+}
+
+fn nextLineEnd(source: []const u8, start: usize) usize {
+    const newline = std.mem.indexOfScalarPos(u8, source, start, '\n') orelse return source.len;
+    return newline + 1;
+}
+
+fn shouldColorShowOutput() bool {
+    if (std.posix.getenv("NO_COLOR")) |value| {
+        return value.len == 0;
+    }
+    return true;
+}
+
+fn showPager() []const u8 {
+    if (std.posix.getenv("LATCH_PAGER")) |pager| return pager;
+    if (std.posix.getenv("GIT_PAGER")) |pager| return pager;
+    if (std.posix.getenv("PAGER")) |pager| return pager;
+    return "less -R";
+}
+
+fn pagerDisablesPaging(pager: []const u8) bool {
+    const trimmed = std.mem.trim(u8, pager, " \t\r\n");
+    return trimmed.len == 0 or std.mem.eql(u8, trimmed, "cat");
+}
+
+fn pageShowOutput(allocator: std.mem.Allocator, pager: []const u8, rendered: []const u8) !void {
+    var child = std.process.Child.init(&.{ "sh", "-c", pager }, allocator);
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+
+    try child.spawn();
+    errdefer {
+        _ = child.kill() catch {};
+    }
+
+    const stdin = child.stdin.?;
+    try stdin.writeAll(rendered);
+    stdin.close();
+    child.stdin = null;
+
+    const term = try child.wait();
+    switch (term) {
+        .Exited => |code| if (code == 0) return,
+        else => {},
+    }
+    return error.PagerFailed;
 }
 
 fn runReview(allocator: std.mem.Allocator, args: []const []const u8, diagnostics: *latch.Diagnostic) !void {
@@ -534,6 +786,9 @@ fn printShowUsage() !void {
         \\  Reads latch-ref fences from the commit body, computes the
         \\  canonical parent-to-commit diff, and prints the expanded Latch
         \\  document with executable diff fences. Defaults to HEAD.
+        \\  When stdout is a TTY, renders ANSI Markdown/diff output through
+        \\  LATCH_PAGER, GIT_PAGER, PAGER, or less -R. Set NO_COLOR to
+        \\  disable ANSI color or LATCH_PAGER=cat to skip paging.
         \\
         \\EXAMPLES
         \\  latch show
@@ -811,6 +1066,50 @@ test "review markdown output lists review metadata and body" {
         \\
         \\
     , output);
+}
+
+test "show renderer indents diff blocks without color" {
+    const source =
+        \\# Title
+        \\
+        \\```diff id=core
+        \\diff --git a/file b/file
+        \\@@ -1 +1 @@
+        \\-old
+        \\+new
+        \\```
+        \\
+    ;
+
+    const rendered = try renderShowMarkdown(std.testing.allocator, source, false);
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "# Title\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "    ```diff id=core") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "    diff --git a/file b/file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "    -old") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "    ```\n") != null);
+}
+
+test "show renderer colors diff lines" {
+    const source =
+        \\# Title
+        \\
+        \\```diff id=core
+        \\@@ -1 +1 @@ fn main()
+        \\-old
+        \\+new
+        \\```
+        \\
+    ;
+
+    const rendered = try renderShowMarkdown(std.testing.allocator, source, true);
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\x1b[1;34m# Title") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "    \x1b[36m@@ -1 +1 @@\x1b[0m fn main()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "    \x1b[31m-old") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "    \x1b[32m+new") != null);
 }
 
 test "review json output includes reviews array" {
