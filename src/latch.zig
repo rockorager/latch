@@ -2687,6 +2687,39 @@ test "requires patch ids" {
     std.testing.allocator.free(owned);
 }
 
+test "preserves hard tabs in diff context lines" {
+    const source =
+        "```diff id=tabs\n" ++
+        "diff --git a/a.rs b/a.rs\n" ++
+        "--- a/a.rs\n" ++
+        "+++ b/a.rs\n" ++
+        "@@ -1,4 +1,4 @@\n" ++
+        " fn main() {\n" ++
+        " \tlet keep = 1;\n" ++
+        "-\tlet x = 1;\n" ++
+        "+\tlet x = 2;\n" ++
+        " }\n" ++
+        "```\n";
+
+    const owned = try std.testing.allocator.dupe(u8, source);
+    var document = try parseDocument(std.testing.allocator, owned);
+    defer document.deinit();
+
+    const expected_diff =
+        "diff --git a/a.rs b/a.rs\n" ++
+        "--- a/a.rs\n" ++
+        "+++ b/a.rs\n" ++
+        "@@ -1,4 +1,4 @@\n" ++
+        " fn main() {\n" ++
+        " \tlet keep = 1;\n" ++
+        "-\tlet x = 1;\n" ++
+        "+\tlet x = 2;\n" ++
+        " }";
+
+    try std.testing.expectEqual(@as(usize, 1), document.patches.len);
+    try std.testing.expectEqualStrings(expected_diff, document.patches[0].diff);
+}
+
 test "detects dependency cycles" {
     const source =
         \\~~~diff id=a depends-on=b

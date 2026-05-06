@@ -3666,9 +3666,16 @@ fn stripIndentColumns(
     line: []const u8,
     columns_to_strip: usize,
 ) std.mem.Allocator.Error!StrippedIndent {
+    if (columns_to_strip == 0) {
+        return .{
+            .text = line,
+            .bytes = 0,
+        };
+    }
+
     var total_columns: usize = 0;
     var index: usize = 0;
-    var stripped_bytes: ?usize = if (columns_to_strip == 0) 0 else null;
+    var stripped_bytes: ?usize = null;
     while (index < line.len and (line[index] == ' ' or line[index] == '\t')) : (index += 1) {
         switch (line[index]) {
             ' ' => total_columns += 1,
