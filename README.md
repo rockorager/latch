@@ -106,17 +106,20 @@ Create a compact Latch Git commit, then reconstruct the full document
 from that commit:
 
 ```sh
-latch commit change.latch.md
+git add src README.md
+latch commit
 latch show > change.latch.md
 ```
 
-`latch commit` uses the document's first H1 as the Git commit subject
-and currently requires a clean tracked worktree. The commit body stores
-the prose with compact `latch-ref` fences rather than full diff bodies;
-`latch show` expands those refs from the commit's canonical parent diff
-and defaults to `HEAD`, like `git show`. When stdout is a TTY, it renders
-colored Markdown/diff output through a pager; when redirected, it writes
-raw reconstructed Markdown.
+`latch commit` without a path drafts from the staged changes, opens the
+draft in Git's editor, and commits the edited Latch document. You can
+also commit an existing document directly with `latch commit
+change.latch.md`. The document's first H1 becomes the Git commit subject.
+The commit body stores the prose with compact `latch-ref` fences rather
+than full diff bodies; `latch show` expands those refs from the commit's
+canonical parent diff and defaults to `HEAD`, like `git show`. When
+stdout is a TTY, it renders colored Markdown/diff output through a pager;
+when redirected, it writes raw reconstructed Markdown.
 
 Extract reviewer comments from a Latch document path or stdin:
 

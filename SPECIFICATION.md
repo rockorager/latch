@@ -203,9 +203,11 @@ document is not considered successfully applied.
 A compact Latch commit stores the code change in the normal Git commit
 tree and a compact Latch recipe in the Git commit message body. The
 first H1 of the source Latch document becomes the Git commit subject;
-the stored recipe omits that H1. `latch show` restores the subject as an
-H1 before expanding the recipe. When no commit is specified, `latch show`
-uses `HEAD`.
+the stored recipe omits that H1. `latch commit` with no document path
+creates an editable draft from the staged changes before writing the
+compact commit. `latch show` restores the subject as an H1 before
+expanding the recipe. When no commit is specified, `latch show` uses
+`HEAD`.
 
 A compact recipe uses fenced code blocks whose info string starts with
 `latch-ref`. A `latch-ref` fence supports the normal patch metadata

@@ -182,15 +182,112 @@ fn runCommit(allocator: std.mem.Allocator, args: []const []const u8, diagnostics
         try printCommitUsage();
         return;
     }
-    if (args.len != 1) return error.MissingDocumentPath;
+    if (args.len > 1) return error.UnexpectedArgument;
 
-    const commit_id = try latch.commitDocumentFromFileWithDiagnostics(allocator, args[0], diagnostics);
+    const commit_id = if (args.len == 0)
+        try commitStagedChanges(allocator, diagnostics)
+    else
+        try latch.commitDocumentFromFileWithDiagnostics(allocator, args[0], diagnostics);
     defer allocator.free(commit_id);
 
     var stdout_buffer: [1024]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     try stdout_writer.interface.print("committed {s}\n", .{std.mem.trimEnd(u8, commit_id, "\r\n")});
     try stdout_writer.interface.flush();
+}
+
+fn commitStagedChanges(allocator: std.mem.Allocator, diagnostics: *latch.Diagnostic) ![]u8 {
+    const draft = try latch.generateDocumentFromGitStagedDiffWithDiagnostics(allocator, diagnostics);
+    defer allocator.free(draft);
+
+    const draft_path = try writeCommitDraft(allocator, draft);
+    defer allocator.free(draft_path);
+    errdefer reportDraftLeft(draft_path) catch {};
+
+    try editCommitDraft(allocator, draft_path);
+
+    const source = try std.fs.cwd().readFileAlloc(allocator, draft_path, max_input_bytes);
+    errdefer allocator.free(source);
+    const trimmed = std.mem.trim(u8, source, " \t\r\n");
+    if (trimmed.len == 0) return error.EmptyCommitDocument;
+    if (std.mem.startsWith(u8, source, "# Draft Latch Document")) return error.UneditedCommitDraft;
+
+    const commit_id = try latch.commitDocumentSourceWithDiagnostics(
+        allocator,
+        source,
+        .{ .require_clean_worktree = false, .reset_mode = .mixed },
+        diagnostics,
+    );
+    errdefer allocator.free(commit_id);
+
+    std.fs.cwd().deleteFile(draft_path) catch |delete_err| {
+        std.log.warn("failed to remove commit draft {s}: {s}", .{ draft_path, @errorName(delete_err) });
+    };
+    return commit_id;
+}
+
+fn writeCommitDraft(allocator: std.mem.Allocator, draft: []const u8) ![]u8 {
+    const temp_dir_raw = try runCommandCapture(
+        allocator,
+        &.{ "git", "rev-parse", "--git-path", "latch-tmp" },
+    );
+    defer allocator.free(temp_dir_raw);
+    const temp_dir = std.mem.trimEnd(u8, temp_dir_raw, "\r\n");
+    try std.fs.cwd().makePath(temp_dir);
+
+    const nonce = std.crypto.random.int(u64);
+    const draft_path = try std.fmt.allocPrint(allocator, "{s}/commit-{x}.latch.md", .{ temp_dir, nonce });
+    errdefer allocator.free(draft_path);
+    try std.fs.cwd().writeFile(.{ .sub_path = draft_path, .data = draft });
+    return draft_path;
+}
+
+fn editCommitDraft(allocator: std.mem.Allocator, draft_path: []const u8) !void {
+    const editor_raw = try runCommandCapture(allocator, &.{ "git", "var", "GIT_EDITOR" });
+    defer allocator.free(editor_raw);
+    const editor = std.mem.trim(u8, editor_raw, " \t\r\n");
+    if (editor.len == 0) return error.MissingEditor;
+
+    const command = try std.fmt.allocPrint(allocator, "{s} \"$1\"", .{editor});
+    defer allocator.free(command);
+
+    var child = std.process.Child.init(&.{ "sh", "-c", command, "latch-editor", draft_path }, allocator);
+    child.stdin_behavior = .Inherit;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+
+    const term = try child.spawnAndWait();
+    switch (term) {
+        .Exited => |code| if (code == 0) return,
+        else => {},
+    }
+    return error.EditorFailed;
+}
+
+fn runCommandCapture(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv,
+        .max_output_bytes = 1024 * 1024,
+    });
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .Exited => |code| {
+            if (code == 0) return result.stdout;
+        },
+        else => {},
+    }
+
+    allocator.free(result.stdout);
+    return error.CommandFailed;
+}
+
+fn reportDraftLeft(draft_path: []const u8) !void {
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+    try stderr_writer.interface.print("draft left at {s}\n", .{draft_path});
+    try stderr_writer.interface.flush();
 }
 
 fn runShow(allocator: std.mem.Allocator, args: []const []const u8, diagnostics: *latch.Diagnostic) !void {
@@ -674,6 +771,7 @@ fn printUsage() !void {
         \\  latch draft HEAD~1 -o change.latch.md
         \\  git diff | latch draft -o change.latch.md
         \\  latch apply change.latch.md
+        \\  latch commit
         \\  latch commit change.latch.md
         \\  latch show
         \\  latch review change.latch.md
@@ -749,21 +847,26 @@ fn printCommitUsage() !void {
     var stderr_buffer: [1024]u8 = undefined;
     var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
     try stderr_writer.interface.writeAll(
-        \\Create a Git commit from a Latch document
+        \\Create a Git commit from staged changes or a Latch document
         \\
         \\USAGE
-        \\  latch commit <document.latch.md>
+        \\  latch commit [document.latch.md]
         \\
         \\OPTIONS
         \\  -h, --help            Show help for commit
         \\
         \\DETAILS
+        \\  With no document path, drafts from staged changes, opens the
+        \\  draft in Git's editor, then commits the edited Latch document.
+        \\  With a path, commits that existing document directly.
+        \\
         \\  The document must start with an H1. The H1 text becomes the Git
         \\  commit subject. The commit body stores a compact Latch recipe
         \\  with latch-ref fences; latch show expands those refs back into
         \\  executable diff fences from the commit diff.
         \\
         \\EXAMPLES
+        \\  latch commit
         \\  latch commit change.latch.md
         \\
     );
@@ -885,6 +988,12 @@ fn reportError(err: anyerror, diagnostics: *const latch.Diagnostic) !void {
             return;
         },
         error.MissingApplyDir => try stderr_writer.interface.writeAll("error: --dir requires a path\n"),
+        error.EmptyCommitDocument => try stderr_writer.interface.writeAll("error: empty Latch commit document\n"),
+        error.UneditedCommitDraft => try stderr_writer.interface.writeAll(
+            "error: edit the draft title before committing\n",
+        ),
+        error.EditorFailed => try stderr_writer.interface.writeAll("error: editor failed\n"),
+        error.MissingEditor => try stderr_writer.interface.writeAll("error: no Git editor configured\n"),
         error.UnexpectedArgument => try stderr_writer.interface.writeAll("error: unexpected extra argument\n"),
         else => try stderr_writer.interface.print("error: {s}\n", .{@errorName(err)}),
     }

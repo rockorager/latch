@@ -208,6 +208,16 @@ const InitialHeading = struct {
     body_start: usize,
 };
 
+pub const CommitResetMode = enum {
+    hard,
+    mixed,
+};
+
+pub const CommitOptions = struct {
+    require_clean_worktree: bool = true,
+    reset_mode: CommitResetMode = .hard,
+};
+
 const PathEntry = struct {
     section: *const DiffSection,
     segments: []const []const u8,
@@ -394,7 +404,19 @@ pub fn commitDocumentFromFileWithDiagnostics(
     var document = try loadDocumentFromFileWithDiagnostics(allocator, path, diagnostics);
     defer document.deinit();
 
-    return commitDocumentWithDiagnostics(allocator, &document, diagnostics);
+    return commitDocumentWithDiagnostics(allocator, &document, .{}, diagnostics);
+}
+
+pub fn commitDocumentSourceWithDiagnostics(
+    allocator: std.mem.Allocator,
+    owned_source: []u8,
+    options: CommitOptions,
+    diagnostics: ?*Diagnostic,
+) ![]u8 {
+    var document = try parseDocumentWithDiagnostics(allocator, owned_source, diagnostics);
+    defer document.deinit();
+
+    return commitDocumentWithDiagnostics(allocator, &document, options, diagnostics);
 }
 
 pub fn showCommitWithDiagnostics(
@@ -542,6 +564,16 @@ pub fn parseReviewDocumentWithDiagnostics(
         .markdown_document = markdown_document,
         .reviews = owned_reviews,
     };
+}
+
+pub fn generateDocumentFromGitStagedDiffWithDiagnostics(
+    allocator: std.mem.Allocator,
+    diagnostics: ?*Diagnostic,
+) ![]u8 {
+    const diff = try collectGitStagedDiff(allocator, diagnostics);
+    defer allocator.free(diff);
+
+    return generateDocumentFromUnifiedDiffWithDiagnostics(allocator, diff, diagnostics);
 }
 
 pub fn generateDocumentFromUnifiedDiff(allocator: std.mem.Allocator, diff: []const u8) ![]u8 {
@@ -755,6 +787,7 @@ pub fn applyPatchesWithDiagnostics(
 fn commitDocumentWithDiagnostics(
     allocator: std.mem.Allocator,
     document: *const Document,
+    options: CommitOptions,
     diagnostics: ?*Diagnostic,
 ) ![]u8 {
     const heading = parseInitialHeading(document.source) orelse return error.MissingLatchHeading;
@@ -762,7 +795,9 @@ fn commitDocumentWithDiagnostics(
     const ordered = try document.orderedPatchIndicesWithDiagnostics(allocator, diagnostics);
     defer allocator.free(ordered);
 
-    try ensureCleanWorktree(allocator);
+    if (options.require_clean_worktree) {
+        try ensureCleanWorktree(allocator);
+    }
 
     const temp_dir_raw = try runGitCapture(
         allocator,
@@ -835,7 +870,11 @@ fn commitDocumentWithDiagnostics(
     );
     allocator.free(update_output);
 
-    const reset_output = try runGitCapture(allocator, &.{ "git", "reset", "--hard", "HEAD" }, null, diagnostics);
+    const reset_arg = switch (options.reset_mode) {
+        .hard => "--hard",
+        .mixed => "--mixed",
+    };
+    const reset_output = try runGitCapture(allocator, &.{ "git", "reset", reset_arg, "HEAD" }, null, diagnostics);
     allocator.free(reset_output);
 
     return commit_id;
@@ -1100,6 +1139,27 @@ fn collectGitWorktreeDiff(allocator: std.mem.Allocator, diagnostics: ?*Diagnosti
         &.{
             "git",
             "diff",
+            "--no-ext-diff",
+            "--no-color",
+            "--no-renames",
+            "--diff-algorithm=histogram",
+            "--no-indent-heuristic",
+            "--unified=3",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "HEAD",
+        },
+        diagnostics,
+    );
+}
+
+fn collectGitStagedDiff(allocator: std.mem.Allocator, diagnostics: ?*Diagnostic) ![]u8 {
+    return runGitForDiff(
+        allocator,
+        &.{
+            "git",
+            "diff",
+            "--cached",
             "--no-ext-diff",
             "--no-color",
             "--no-renames",

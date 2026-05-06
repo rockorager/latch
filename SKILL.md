@@ -103,17 +103,23 @@ start from a blank document; always begin with the mechanical draft from
      dependencies, then run `latch apply` again.
    - If you do not validate, say so explicitly in the final response.
 
-9. Commit the document only when the user asks.
-   - Use:
+9. Commit only when the user asks.
+   - To commit an existing Latch document, use:
      ```sh
      latch commit .latch/change.latch.md
+     ```
+   - To draft from staged changes in Git's editor and commit the edited
+     document, use:
+     ```sh
+     latch commit
      ```
    - `latch commit` creates a Git commit from the Latch document and stores a
      compact recipe in the commit body instead of full diff bodies.
    - The document's first H1 becomes the Git commit subject.
-   - The tracked worktree must be clean before running `latch commit`; if it is
-     not clean, either ask the user how to proceed or preserve the diff before
-     cleaning/resetting.
+   - When committing from a document path, preserve or clean tracked worktree
+     changes before running `latch commit`; the path form materializes the
+     committed tree. The no-argument staged form behaves more like `git commit`
+     and preserves unstaged tracked changes.
    - After committing, verify reconstructability when practical:
      ```sh
      latch show > /tmp/change.latch.md
@@ -131,25 +137,33 @@ start from a blank document; always begin with the mechanical draft from
 Use this workflow when the user asks to commit a Latch document or reconstruct
 one from a compact Latch commit.
 
-1. Commit from a finished Latch document with:
+1. Commit staged changes with:
+   ```sh
+   latch commit
+   ```
+   This drafts from the staged diff, opens the draft in Git's editor, then
+   commits the edited Latch document. Use this when the user wants a Git-like
+   commit flow.
+
+2. Commit from a finished Latch document with:
    ```sh
    latch commit .latch/change.latch.md
    ```
    Do not use `git commit` for this workflow; `latch commit` writes the code
    tree and compact Latch recipe together.
 
-2. Reconstruct from the latest compact Latch commit with:
+3. Reconstruct from the latest compact Latch commit with:
    ```sh
    latch show > .latch/change.latch.md
    ```
    `latch show` defaults to `HEAD`, like `git show`. Use `latch show <commit>`
    for another commit.
 
-3. Prefer `latch show` over `latch draft <commit>` when the commit was created
+4. Prefer `latch show` over `latch draft <commit>` when the commit was created
    by `latch commit`. `latch show` reconstructs the authored narrative;
    `latch draft` only creates a new mechanical draft from the commit diff.
 
-4. A compact recipe contains `latch-ref` fences with `ranges=...`. Do not edit
+5. A compact recipe contains `latch-ref` fences with `ranges=...`. Do not edit
    those by hand unless you are intentionally working on compact carriage. Use
    `latch show` to materialize normal executable `diff` fences for authoring.
 
@@ -227,8 +241,8 @@ Describe the requested change or concern here.
 - `latch draft`: generate a first-pass Latch document from stdin, a Git spec,
   or the current worktree diff.
 - `latch apply`: apply patches from a Latch document.
-- `latch commit`: create a Git commit from a Latch document, storing a compact
-  recipe in the commit message body.
+- `latch commit`: create a Git commit from staged changes or a Latch document,
+  storing a compact recipe in the commit message body.
 - `latch show`: reconstruct a full Latch document from a compact Latch commit;
   defaults to `HEAD`.
 - `latch review`: extract reviewer comments from a Latch document.
@@ -263,6 +277,7 @@ latch draft HEAD~1 > .latch/change.latch.md
 git diff | latch draft > .latch/change.latch.md
 latch apply .latch/change.latch.md
 latch commit .latch/change.latch.md
+latch commit
 latch show > .latch/change.latch.md
 ```
 
